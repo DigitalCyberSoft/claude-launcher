@@ -1,0 +1,18 @@
+# The launcher writes all runtime state under $CLAUDE_LAUNCHER_HOME
+# (default ~/.config/claude-launcher), never into the repo. Nothing here
+# is generated at build time. These entries just guard against someone
+# running tests or seeding inside a clone.
+config
+state
+providers/
+cache/
+litellm.yaml
+statusline.sh
+*.conf
+*.conf.old
+*.conf.bak-*
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store

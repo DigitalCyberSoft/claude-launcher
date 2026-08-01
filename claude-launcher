@@ -1,0 +1,1818 @@
+#!/usr/bin/env bash
+# claude-launcher - interactive front-end for Claude Code.
+#
+# Bare `claude` (aliased to this script) shows a menu: session type
+# (fresh / continue / resume), provider, model, effort, and per-run
+# toggles (hooks / DTM system prompt / safe mode). New models are
+# detected against the provider's models endpoint at most once per day
+# and added to the suggestions; individual models can be disabled so
+# they are no longer suggested.
+#
+# Any invocation WITH arguments passes straight through to the real
+# claude binary with the remembered provider, model, and effort applied
+# (parity with the old alias). Menu toggles are NOT applied on the
+# pass-through path; claude subcommands (mcp, doctor, update, ...) are
+# passed through completely untouched.
+#
+# State and provider definitions live in ~/.config/claude-launcher
+# (override with CLAUDE_LAUNCHER_HOME). Set CLAUDE_LAUNCHER_DRY_RUN=1
+# to print the final command instead of exec'ing it.
+#
+# Facts this script relies on, verified against Claude Code 2.1.220:
+#   - --effort levels low|medium|high|xhigh|max          (claude --help)
+#   - disableAllHooks settings key: "Disable all hooks and custom status
+#     line" (code.claude.com/docs/en/settings.md); confirmed effective
+#     when passed as --settings JSON on 2.1.220 (sentinel-hook test)
+#   - --system-prompt-file / --append-system-prompt-file  (parse-tested)
+#   - ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_MODEL /
+#     ANTHROPIC_DEFAULT_HAIKU_MODEL                (docs/en/env-vars.md)
+#   - --model overrides ANTHROPIC_MODEL   (docs/en/llm-gateway-connect.md)
+#   - GET https://api.anthropic.com/v1/models?limit=100 returns
+#     {"data":[{"id":...}]} (exercised 2026-08-01, HTTP 200)
+#   - CLAUDE_CODE_MAX_OUTPUT_TOKENS raises the request max_tokens,
+#     clamped per model (registry ceiling 128000; unknown models default
+#     32000) - wire-captured on 2.1.220
+#   - CLAUDE_CODE_MAX_CONTEXT_TOKENS sets the believed context window for
+#     non-claude-* model ids (claude-* ids ignore it); unknown models
+#     otherwise fall back to 200000 and auto-compact there - decompiled
+#     from the 2.1.220 binary, 2026-08-02
+#   - CLAUDE_CODE_AUTO_COMPACT_WINDOW clamps the auto-compact window
+#     (min(model window, value)) - same source
+#   - --effort <level> is sent as output_config.effort - wire-captured
+#     2026-08-02; Moonshot's /anthropic endpoint maps it to
+#     reasoning_effort (low -> 2 thinking tokens vs max -> 120, live
+#     probe 2026-08-02)
+
+set -u
+
+CL_HOME="${CLAUDE_LAUNCHER_HOME:-$HOME/.config/claude-launcher}"
+CONFIG_FILE="$CL_HOME/config"
+STATE_FILE="$CL_HOME/state"
+PROVIDER_DIR="$CL_HOME/providers"
+CACHE_DIR="$CL_HOME/cache"
+
+EFFORTS=(low medium high xhigh max)
+# Subcommands from `claude --help` (2.1.220): never decorated.
+SUBCOMMANDS=(agents auth auto-mode doctor gateway install mcp plugin plugins
+             project setup-token ultrareview update upgrade)
+
+die() { printf 'claude-launcher: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- seeding
+
+seed_files() {
+    mkdir -p "$PROVIDER_DIR" || die "cannot create $PROVIDER_DIR"
+
+    [[ -e $CONFIG_FILE ]] || cat >"$CONFIG_FILE" <<'EOF'
+# claude-launcher configuration (sourced by bash).
+
+# Path to the real claude binary. Empty = first `claude` in PATH.
+claude_bin=""
+
+# File used by the "dtm prompt" toggle.
+system_prompt_file="$HOME/.claude/system-prompts/dtm/dtm.md"
+
+# replace = --system-prompt-file (replaces Claude Code's default system
+#           prompt; matches the old commented alias in ~/.bashrc)
+# append  = --append-system-prompt-file (keeps the default, appends)
+system_prompt_mode="replace"
+EOF
+
+    [[ -e $PROVIDER_DIR/anthropic.conf ]] || cat >"$PROVIDER_DIR/anthropic.conf" <<'EOF'
+# Native Anthropic API: no endpoint or auth override, uses your normal
+# Claude Code login. [1m] = 1M-token context window
+# (code.claude.com/docs/en/model-config.md).
+name="Anthropic"
+base_url=""
+auth_token_env=""
+# Model discovery (GET /v1/models needs an API key, not the OAuth login):
+models_url="https://api.anthropic.com/v1/models?limit=100"
+models_auth_env="ANTHROPIC_API_KEY"
+# Always use the largest context window: append [1m] automatically when
+# the live listing reports max_input_tokens >= 1000000 for the model.
+auto_1m=1
+# Pass --effort only at levels the selected model supports, per the live
+# listing's capabilities.effort flags ("detect"). Alternatives: an explicit
+# list like "low medium high", or "" to never pass --effort.
+efforts="detect"
+# Raise the request max_tokens to the model's ceiling (64000 -> 128000
+# for current claude models; Claude Code clamps to each model's limit).
+max_output_tokens=128000
+models=(
+    "claude-opus-4-8[1m]"
+    "claude-fable-5[1m]"
+    "claude-opus-5"
+    "claude-sonnet-5"
+    "claude-haiku-4-5"
+)
+# Subscription usage: same unofficial OAuth endpoint the statusline
+# polls (api.anthropic.com/api/oauth/usage with the Claude Code login
+# token; not in the public API docs, so it may change). Not available
+# to plain API keys.
+provider_info() {
+    local tok out five week cred mode line=""
+    tok=$(jq -r '.claudeAiOauth.accessToken // empty' "$HOME/.claude/.credentials.json" 2>/dev/null)
+    [[ -n $tok ]] || return 0
+    out=$(curl -sf -m 6 https://api.anthropic.com/api/oauth/usage \
+        -H "Authorization: Bearer $tok" \
+        -H "anthropic-beta: oauth-2025-04-20" 2>/dev/null) || return 0
+    five=$(printf '%s' "$out" | jq -r \
+        '(.five_hour.utilization // empty) | 100 - . | if . < 0 then 0 else . end | floor' 2>/dev/null)
+    week=$(printf '%s' "$out" | jq -r \
+        '(.seven_day.utilization // empty) | 100 - . | if . < 0 then 0 else . end | floor' 2>/dev/null)
+    cred=$(printf '%s' "$out" | jq -r 'if .extra_usage.is_enabled == true
+        then (if .extra_usage.monthly_limit != null
+            then ((.extra_usage.monthly_limit - .extra_usage.used_credits) / pow(10; .extra_usage.decimal_places))
+            else (.extra_usage.used_credits / pow(10; .extra_usage.decimal_places)) end)
+        else empty end' 2>/dev/null)
+    mode=$(printf '%s' "$out" | jq -r 'if .extra_usage.is_enabled == true
+        then (if .extra_usage.monthly_limit != null then "left" else "used" end)
+        else empty end' 2>/dev/null)
+    [[ -n $five ]] && line+="5h:${five}% left"
+    [[ -n $week ]] && line+="${line:+ · }7d:${week}% left"
+    [[ -n $cred ]] && line+="${line:+ · }\$$(printf '%.2f' "$cred") extra ${mode}"
+    printf '%s' "$line"
+}
+EOF
+
+    [[ -e $PROVIDER_DIR/moonshot.conf ]] || cat >"$PROVIDER_DIR/moonshot.conf" <<'EOF'
+# Moonshot AI (Kimi), Anthropic-compatible endpoint.
+# Source: platform.kimi.ai/docs/guide/claude-code-kimi
+# Uses the KIMI_API_KEY exported in ~/.bashrc.
+name="Moonshot (Kimi)"
+base_url="https://api.moonshot.ai/anthropic"
+auth_token_env="KIMI_API_KEY"
+# Background/haiku-class calls must not go to Anthropic model names:
+default_haiku_model="kimi-k3"
+# kimi-k3 supports reasoning effort low/high/max (default max); Claude
+# Code's --effort reaches it as output_config.effort (verified live
+# 2026-08-02: low -> 2 thinking tokens vs max -> 120 on the same
+# prompt). "detect" reads each model's reasoning_efforts.valid_efforts
+# from the live listing, so k2.x models get no --effort.
+efforts="detect"
+# Always use the largest context window: append [1m] when the live
+# listing reports a 1M context (Moonshot lists it as context_length;
+# their own Claude Code guide prescribes kimi-k3[1m]).
+auto_1m=1
+# Claude Code defaults unknown models to max_tokens 32000; 128000 is its
+# ceiling for unlisted models (wire-verified 2026-08-02).
+max_output_tokens=128000
+# No models route on the /anthropic path (404, checked 2026-08-01);
+# the OpenAI-compatible route serves the same account's model list.
+models_url="https://api.moonshot.ai/v1/models"
+# List below verified live against /v1/models on 2026-08-01.
+models=(
+    "kimi-k3"
+    "kimi-k2.7-code"
+    "kimi-k2.7-code-highspeed"
+    "kimi-k2.6"
+)
+# Account balance shown in the menu (endpoint verified 2026-08-01).
+provider_info() {
+    local key="${!auth_token_env-}"
+    [[ -n $key ]] || return 0
+    curl -sf --max-time 6 https://api.moonshot.ai/v1/users/me/balance \
+        -H "authorization: Bearer $key" 2>/dev/null \
+        | jq -r '.data | "balance \(.available_balance) (cash \(.cash_balance) + voucher \(.voucher_balance))"' \
+        2>/dev/null
+}
+EOF
+
+    [[ -e $PROVIDER_DIR/openai.conf ]] || cat >"$PROVIDER_DIR/openai.conf" <<'EOF'
+# OpenAI via the local LiteLLM proxy (OpenAI serves no Anthropic-compatible
+# endpoint, verified 2026-08 against developers.openai.com). Proxy setup:
+#   pip install 'litellm[proxy]'
+#   litellm --config $CL_HOME/litellm.yaml
+name="OpenAI (via LiteLLM)"
+base_url="http://127.0.0.1:4000"
+auth_token_env="LITELLM_MASTER_KEY"
+auth_optional=1
+preflight_hint="start the proxy: litellm --config $CL_HOME/litellm.yaml"
+# OpenAI's /v1/models carries no context/output metadata (id/created/
+# owned_by only, checked 2026-08-02), so context is declared per model
+# here rather than discovered. context_map drives auto [1m] and the
+# CLAUDE_CODE_MAX_CONTEXT_TOKENS override. Numbers from
+# developers.openai.com model pages, 2026-08-02.
+auto_1m=1
+context_map="
+gpt-5.6-sol 1050000
+gpt-5.3-codex 272000
+"
+# Reasoning effort reaches OpenAI as reasoning_effort IF the LiteLLM
+# proxy forwards Anthropic output_config.effort (see litellm.yaml note).
+# Per-model valid sets, live-probed 2026-08-02 against the Responses API:
+# sol takes up to max; codex rejects "max" and "minimal" with a 400.
+# efforts="map" emits ONLY listed values (no --effort for absent models).
+efforts="map"
+efforts_map="
+gpt-5.6-sol low,medium,high,xhigh,max
+gpt-5.3-codex low,medium,high,xhigh
+"
+# max_tokens ceiling 128000 for both (developers.openai.com, 2026-08-02).
+max_output_tokens=128000
+models_url="http://127.0.0.1:4000/v1/models"
+models_filter="^(gpt|o[0-9])"
+models=(
+    "gpt-5.6-sol"
+    "gpt-5.3-codex"
+)
+# OpenAI exposes no balance to normal API keys (credit_grants needs a
+# browser session key; the Costs API needs an admin key) - checked
+# 2026-08-01 - so this reports proxy health and key validity only.
+provider_info() {
+    local out n
+    if n=$(curl -sf --max-time 4 "$models_url" | jq -r '.data | length' 2>/dev/null) \
+        && [[ $n =~ ^[0-9]+$ ]]; then
+        out="proxy up · $n models"
+    else
+        out="proxy down"
+    fi
+    if [[ -n ${OPENAI_API_KEY-} ]]; then
+        if curl -sf --max-time 4 -o /dev/null https://api.openai.com/v1/models \
+            -H "authorization: Bearer $OPENAI_API_KEY" 2>/dev/null; then
+            out+=" · openai key ok"
+        else
+            out+=" · openai key FAILED"
+        fi
+    else
+        out+=" · OPENAI_API_KEY unset"
+    fi
+    printf '%s' "$out"
+}
+EOF
+
+    [[ -e $PROVIDER_DIR/grok.conf ]] || cat >"$PROVIDER_DIR/grok.conf" <<'EOF'
+# Grok via the local LiteLLM proxy (xAI's current API serves no
+# Anthropic-compatible endpoint, verified 2026-08 against docs.x.ai).
+# Proxy setup:
+#   pip install 'litellm[proxy]'
+#   litellm --config $CL_HOME/litellm.yaml
+name="Grok (via LiteLLM)"
+base_url="http://127.0.0.1:4000"
+auth_token_env="LITELLM_MASTER_KEY"
+auth_optional=1
+preflight_hint="start the proxy: litellm --config $CL_HOME/litellm.yaml"
+# xAI's /v1/language-models carries pricing + long_context_threshold but
+# no context-window or output field (checked 2026-08-02), so context is
+# declared per model. Windows from docs.x.ai models page, 2026-08-02
+# (grok-4.3 is the 1M-context model; grok-4.5 500K; grok-build-0.1 256K).
+auto_1m=1
+context_map="
+grok-4.5 500000
+grok-4.3 1000000
+grok-build-0.1 256000
+"
+# reasoning_effort reaches Grok IF the LiteLLM proxy forwards
+# output_config.effort (see litellm.yaml note). Per-model valid sets,
+# live-probed 2026-08-02 against api.x.ai: 4.x reasoning models take
+# minimal..xhigh but 400 on "max"; grok-build-0.1 rejects reasoning_effort
+# entirely (absent from the map -> no --effort).
+efforts="map"
+efforts_map="
+grok-4.5 low,medium,high,xhigh
+grok-4.3 low,medium,high,xhigh
+"
+# xAI publishes no explicit max-output cap and the API silently clamps an
+# oversized max_tokens (checked 2026-08-02); leave unset so Claude Code
+# uses its own default rather than assert an unsourced number.
+models_url="http://127.0.0.1:4000/v1/models"
+models_filter="^grok"
+models=(
+    "grok-4.5"
+    "grok-build-0.1"
+    "grok-4.3"
+)
+provider_info() {
+    local out n blocked
+    if n=$(curl -sf --max-time 4 "$models_url" | jq -r '.data | length' 2>/dev/null) \
+        && [[ $n =~ ^[0-9]+$ ]]; then
+        out="proxy up · $n models"
+    else
+        out="proxy down"
+    fi
+    if [[ -n ${XAI_API_KEY-} ]]; then
+        blocked=$(curl -sf --max-time 4 https://api.x.ai/v1/api-key \
+            -H "authorization: Bearer $XAI_API_KEY" 2>/dev/null \
+            | jq -r '.api_key_blocked' 2>/dev/null)
+        case $blocked in
+            false) out+=" · xai key ok" ;;
+            true)  out+=" · xai key BLOCKED" ;;
+            *)     out+=" · xai key unreachable" ;;
+        esac
+    else
+        out+=" · XAI_API_KEY unset"
+    fi
+    printf '%s' "$out"
+}
+EOF
+
+    [[ -e $CL_HOME/litellm.yaml ]] || cat >"$CL_HOME/litellm.yaml" <<'EOF'
+# LiteLLM proxy config for claude-launcher's openai and grok providers.
+# Model names on the left are what the launcher passes via --model.
+# Requires OPENAI_API_KEY / XAI_API_KEY in the environment.
+#
+# REASONING EFFORT PASS-THROUGH IS LiteLLM-VERSION-SENSITIVE.
+# Claude Code 2.1.220 sends reasoning as output_config.effort. LiteLLM
+# main (read 2026-08-02, BerriAI/litellm) translates it to OpenAI
+# reasoning_effort (openai/* via the Responses path, xai/* via the chat
+# path), UNCLAMPED. But the published mapping doc omits output_config, so
+# a PINNED OR OLDER LiteLLM release silently drops the effort and defaults
+# every request to "medium". If effort seems stuck, upgrade LiteLLM or
+# verify translate_thinking_to_reasoning against your deployed tag. The
+# launcher's per-model effort menus are correct regardless; this only
+# governs whether the chosen level actually reaches the model.
+model_list:
+  - model_name: gpt-5.6-sol
+    litellm_params:
+      model: openai/gpt-5.6-sol
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-5.3-codex
+    litellm_params:
+      model: openai/gpt-5.3-codex
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: grok-4.5
+    litellm_params:
+      model: xai/grok-4.5
+      api_key: os.environ/XAI_API_KEY
+  - model_name: grok-build-0.1
+    litellm_params:
+      model: xai/grok-build-0.1
+      api_key: os.environ/XAI_API_KEY
+  - model_name: grok-4.3
+    litellm_params:
+      model: xai/grok-4.3
+      api_key: os.environ/XAI_API_KEY
+EOF
+
+    [[ -e $PROVIDER_DIR/custom.conf.example ]] || cat >"$PROVIDER_DIR/custom.conf.example" <<'EOF'
+# Copy to <id>.conf to add a provider with an Anthropic-compatible API.
+# Documented native options as of 2026-08:
+#   DeepSeek: base_url="https://api.deepseek.com/anthropic"
+#             auth_var="ANTHROPIC_API_KEY"   (DeepSeek wants X-Api-Key)
+#             (api-docs.deepseek.com/guides/anthropic_api)
+#   Z.ai:     base_url="https://api.z.ai/api/anthropic"  glm-5.2[1m]
+#   MiniMax:  base_url="https://api.minimax.io/anthropic" MiniMax-M3[1m]
+name="Example"
+base_url="https://api.example.com/anthropic"
+auth_token_env="EXAMPLE_API_KEY"   # your key lives in this env var
+auth_var="ANTHROPIC_AUTH_TOKEN"    # env var handed to claude (default)
+auth_optional=0                    # 1 = missing key is only a warning
+default_haiku_model=""             # model for background/haiku-class calls
+preflight_hint=""                  # extra text if endpoint is unreachable
+models_url=""                      # GET endpoint listing {"data":[{"id":..}]}
+models_auth_env=""                 # key env for models_url (default: auth_token_env)
+efforts=""                         # "detect" | "low medium high" | "" (no --effort)
+models_filter=""                   # regex keeping only matching discovered ids
+# auto_1m=1                        # append [1m] when the live listing reports
+#                                  # max_input_tokens/context_length >= 1M
+# max_output_tokens=128000         # raise CC's 32000 unknown-model default
+models=("model-a" "model-b")
+# extra_env=("FOO=bar")            # extra environment for claude
+# Optional: one line of account data for the menu (cached 15 min).
+# provider_info() { curl -sf --max-time 6 ... | jq -r '...'; }
+EOF
+
+    [[ -e $CL_HOME/statusline.sh ]] || cat >"$CL_HOME/statusline.sh" <<'EOF'
+#!/usr/bin/env bash
+# claude-launcher statusline: same segments as a stock Anthropic
+# statusline (model, context usage, rate limits), plus one account-data
+# segment from the active provider's provider_info() - balance for
+# Moonshot, usage/credits for Anthropic - cached 15 min in
+# cache/info__<provider> (shared with the launcher menu).
+input=$(cat)
+model=$(printf '%s' "$input" | jq -r '.model.display_name // empty')
+used=$(printf '%s' "$input" | jq -r '.context_window.total_input_tokens // empty')
+total=$(printf '%s' "$input" | jq -r '.context_window.context_window_size // empty')
+pct=$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty' | cut -d. -f1)
+
+provider=${CLAUDE_LAUNCHER_PROVIDER:-}
+home=${CLAUDE_LAUNCHER_HOME:-$HOME/.config/claude-launcher}
+acct=""
+if [[ -n $provider && -r $home/providers/$provider.conf ]]; then
+    cache=$home/cache/info__$provider
+    if [[ -f $cache && -z $(find "$cache" -mmin +15 2>/dev/null) ]]; then
+        acct=$(cat "$cache")
+    else
+        # Fresh process: no launcher globals exist, but reset the conf
+        # fields anyway so a conf omitting one cannot pick up a stray
+        # exported variable.
+        acct=$(
+            name="" base_url="" auth_token_env="" auth_var=""
+            default_haiku_model="" auth_optional=0 preflight_hint=""
+            models_url="" models_auth_env="" auto_1m=0 efforts=""
+            models_filter="" max_output_tokens=""
+            models=() extra_env=()
+            unset -f provider_info 2>/dev/null
+            . "$home/providers/$provider.conf" 2>/dev/null
+            declare -F provider_info >/dev/null && provider_info
+        )
+        mkdir -p "$home/cache"
+        printf '%s' "$acct" >"$cache"
+    fi
+fi
+
+# Rate limits from the statusline payload only when the provider line
+# does not already carry them (Anthropic's provider_info does).
+five="" week=""
+if [[ -z $acct ]]; then
+    five=$(printf '%s' "$input" | jq -r '(.rate_limits.five_hour.used_percentage // empty) | (100 - .) | if . < 0 then 0 else . end')
+    week=$(printf '%s' "$input" | jq -r '(.rate_limits.seven_day.used_percentage // empty) | (100 - .) | if . < 0 then 0 else . end')
+fi
+
+RED='\033[31m'; RESET='\033[0m'
+text=$(printf '[%s@%s %s]' "$(whoami)" "$(hostname -s)" "$(basename "$(pwd)")")
+if [[ -n $model ]]; then
+    [[ -n $provider && $provider != anthropic ]] && model+=" ($provider)"
+    text+=" | $model"
+fi
+if [[ -n $used && -n $total ]]; then
+    ctx="${used}/${total} tokens"
+    if [[ -n $pct && $pct -ge 90 ]] 2>/dev/null; then ctx="${RED}${ctx}${RESET}"; fi
+    text+=" | $ctx"
+fi
+if [[ -n $five || -n $week ]]; then
+    rl=""
+    if [[ -n $five ]]; then
+        fpct=$(printf '%.0f' "$five")
+        seg="5h:${fpct}%"
+        [[ $fpct -le 10 ]] 2>/dev/null && seg="${RED}${seg}${RESET}"
+        rl=$seg
+    fi
+    if [[ -n $week ]]; then
+        wpct=$(printf '%.0f' "$week")
+        seg="7d:${wpct}%"
+        [[ $wpct -le 10 ]] 2>/dev/null && seg="${RED}${seg}${RESET}"
+        rl+="${rl:+ }$seg"
+    fi
+    text+=" | ${rl} left"
+fi
+[[ -n $acct ]] && text+=" | $acct"
+plain=$(printf '%s' "$text" | sed -E 's/\\033\[[0-9;]*m//g')
+pad=$(( ${COLUMNS:-80} - ${#plain} ))
+((pad < 0)) && pad=0
+printf '%*s' "$pad" ''
+printf '%b\n' "$text"
+EOF
+    chmod +x "$CL_HOME/statusline.sh" 2>/dev/null
+}
+
+# ---------------------------------------------------------- config/state
+
+claude_bin=""
+system_prompt_file=""
+system_prompt_mode="replace"
+
+load_config() {
+    # shellcheck disable=SC1090
+    [[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
+}
+
+declare -A STATE=()
+
+load_state() {
+    local k v
+    [[ -r $STATE_FILE ]] || return 0
+    while IFS='=' read -r k v; do
+        [[ -z $k || $k == \#* ]] && continue
+        STATE[$k]=$v
+    done <"$STATE_FILE"
+}
+
+state_get() { printf '%s' "${STATE[$1]-$2}"; }
+state_set() { STATE[$1]=$2; save_state; }
+
+save_state() {
+    local tmp="$STATE_FILE.tmp.$$" k
+    {
+        printf '# claude-launcher state (managed; edit while no menu is open)\n'
+        for k in "${!STATE[@]}"; do printf '%s=%s\n' "$k" "${STATE[$k]}"; done
+    } >"$tmp" || die "cannot write $tmp"
+    mv "$tmp" "$STATE_FILE" || die "cannot update $STATE_FILE"
+}
+
+normalize_ws() {
+    local s=$1
+    while [[ $s == *"  "* ]]; do s=${s//  / }; done
+    s=${s# }; s=${s% }
+    printf '%s' "$s"
+}
+
+# ------------------------------------------------------------- providers
+
+name="" base_url="" auth_token_env="" auth_var="" default_haiku_model=""
+auth_optional=0 preflight_hint="" models_url="" models_auth_env="" auto_1m=0
+max_output_tokens="" efforts_map="" context_map=""
+models=() extra_env=()
+
+load_provider() {
+    local id=$1
+    name="" base_url="" auth_token_env="" auth_var="ANTHROPIC_AUTH_TOKEN"
+    default_haiku_model="" auth_optional=0 preflight_hint=""
+    models_url="" models_auth_env="" auto_1m=0 efforts="" models_filter=""
+    max_output_tokens="" efforts_map="" context_map=""
+    models=() extra_env=()
+    unset -f provider_info 2>/dev/null
+    [[ -r $PROVIDER_DIR/$id.conf ]] || die "no provider '$id' ($PROVIDER_DIR/$id.conf)"
+    # shellcheck disable=SC1090
+    . "$PROVIDER_DIR/$id.conf"
+    ((${#models[@]})) || die "provider '$id' defines no models"
+    [[ -n $models_auth_env ]] || models_auth_env=$auth_token_env
+}
+
+provider_ids() {
+    local f
+    for f in "$PROVIDER_DIR"/*.conf; do
+        [[ -e $f ]] || continue
+        basename "$f" .conf
+    done
+}
+
+current_model() {
+    state_get "model__$1" "${models[0]}"
+}
+
+model_context() {
+    # Context window (max input tokens) for model id $1, bare of any
+    # [..] suffix. Live discovery cache first (Anthropic max_input_tokens,
+    # Moonshot context_length); then the conf's context_map, for providers
+    # whose listing carries no context field (OpenAI/xAI through LiteLLM,
+    # verified 2026-08-02: /v1/models returns ids only). Empty if unknown.
+    local id=${1%%\[*} ctx
+    ctx=$(awk -v id="$id" '$1 == id { print $2; exit }' \
+        "$CACHE_DIR/context__$provider" 2>/dev/null)
+    [[ $ctx =~ ^[0-9]+$ ]] || ctx=$(awk -v id="$id" '$1 == id { print $2; exit }' \
+        <<<"$context_map" 2>/dev/null)
+    [[ $ctx =~ ^[0-9]+$ ]] && printf '%s' "$ctx"
+}
+
+resolve_model() {
+    # Effective model for launch: the remembered model, plus an automatic
+    # [1m] suffix when the provider opts in (auto_1m=1) and the model's
+    # context window is at least 1M tokens.
+    local m ctx
+    m=$(current_model "$provider")
+    if ((auto_1m)) && [[ $m != *\[* ]]; then
+        ctx=$(model_context "$m")
+        [[ $ctx =~ ^[0-9]+$ ]] && ((ctx >= 1000000)) && m+="[1m]"
+    fi
+    printf '%s' "$m"
+}
+
+# --------------------------------------------------------- model discovery
+
+fetch_models_json() {
+    local timeout=$1 key=""
+    [[ -n $models_url ]] || return 1
+    [[ -n $models_auth_env ]] && key="${!models_auth_env-}"
+    curl -sf --max-time "$timeout" "$models_url" \
+        ${key:+-H "x-api-key: $key"} \
+        ${key:+-H "authorization: Bearer $key"} \
+        -H "anthropic-version: 2023-06-01" 2>/dev/null
+}
+
+parse_model_ids() {
+    # stdin: models JSON; stdout: one id per line
+    if command -v jq >/dev/null 2>&1; then
+        jq -r '.data[].id' 2>/dev/null
+    else
+        grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed 's/.*"\([^"]*\)"$/\1/'
+    fi | grep -v '^$'
+    return 0
+}
+
+write_context_map() {
+    # stdin: models JSON. Cache "id <context tokens>" pairs. Anthropic-style
+    # listings carry max_input_tokens; Moonshot's carries context_length.
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -r '.data[]
+        | select(.max_input_tokens != null or .context_length != null)
+        | "\(.id) \(.max_input_tokens // .context_length)"' \
+        2>/dev/null >"$CACHE_DIR/context__$provider"
+    return 0
+}
+
+write_efforts_map() {
+    # stdin: models JSON. Cache "id low,medium,..." per model from the
+    # listing's effort metadata; "id -" for models without effort support.
+    # Anthropic-style: capabilities.effort flags. Moonshot-style:
+    # reasoning_efforts.valid_efforts.
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -r '.data[] | .id as $id
+        | if .capabilities != null then
+            .capabilities.effort as $e
+            | if ($e != null and $e.supported == true) then
+                "\($id) " + ([$e | to_entries[]
+                    | select((.value | type == "object") and .value.supported == true)
+                    | .key] | join(","))
+              else "\($id) -" end
+          elif .reasoning_efforts != null then
+            if (.reasoning_efforts.support == true
+                and (.reasoning_efforts.valid_efforts | type == "array")) then
+                "\($id) " + (.reasoning_efforts.valid_efforts | join(","))
+            else "\($id) -" end
+          else "\($id) -" end' \
+        2>/dev/null >"$CACHE_DIR/efforts__$provider"
+    return 0
+}
+
+effort_options() {
+    # Effort levels valid for the current provider + model, one per line.
+    local m lvls l
+    case $efforts in
+        '') return 0 ;;
+        detect)
+            m=$(current_model "$provider")
+            m=${m%%\[*}
+            lvls=$(awk -v id="$m" '$1 == id { print $2; exit }' \
+                "$CACHE_DIR/efforts__$provider" 2>/dev/null)
+            case $lvls in
+                '') printf '%s\n' "${EFFORTS[@]}"; return 0 ;;  # unknown model: full ladder
+                -)  return 0 ;;                                 # model has no effort support
+            esac
+            for l in "${EFFORTS[@]}"; do
+                [[ ",$lvls," == *",$l,"* ]] && printf '%s\n' "$l"
+            done
+            ;;
+        map)
+            # Per-model effort sets declared in the conf (efforts_map, one
+            # "id l,m,h" line per model), for providers whose listing
+            # carries no effort metadata (OpenAI/xAI through LiteLLM). A
+            # model absent from the map gets NO --effort: safer than the
+            # full ladder, because these vendors 400 on an unsupported
+            # value (verified 2026-08-02: gpt-5.3-codex rejects "max",
+            # grok-build-0.1 rejects reasoning_effort entirely).
+            m=$(current_model "$provider")
+            m=${m%%\[*}
+            lvls=$(awk -v id="$m" '$1 == id { print $2; exit }' \
+                <<<"$efforts_map" 2>/dev/null)
+            [[ -n $lvls && $lvls != - ]] || return 0
+            for l in "${EFFORTS[@]}"; do
+                [[ ",$lvls," == *",$l,"* ]] && printf '%s\n' "$l"
+            done
+            ;;
+        *)
+            for l in $efforts; do printf '%s\n' "$l"; done
+            ;;
+    esac
+    return 0
+}
+
+resolve_effort() {
+    # Saved effort clamped to what the model supports; empty = no --effort.
+    local want opts=()
+    mapfile -t opts < <(effort_options)
+    ((${#opts[@]})) || return 0
+    want=$(state_get effort max)
+    local o
+    for o in "${opts[@]}"; do
+        [[ $o == "$want" ]] && { printf '%s' "$want"; return 0; }
+    done
+    printf '%s' "${opts[-1]}"   # highest supported
+}
+
+refresh_models() {
+    # $1 = auto | manual. Baseline on first fetch; afterwards report and
+    # suggest only ids that appear later ("new models").
+    local mode=$1 timeout=4 json ids added
+    local known="$CACHE_DIR/known__$provider" extra="$CACHE_DIR/extra__$provider"
+    if [[ -z $models_url ]]; then
+        [[ $mode == manual ]] && printf '  %s has no models_url configured\n' "$provider"
+        return 0
+    fi
+    [[ $mode == manual ]] && timeout=10
+    mkdir -p "$CACHE_DIR"
+    if ! json=$(fetch_models_json "$timeout") || [[ -z $json ]]; then
+        [[ $mode == manual ]] && printf '  model refresh failed for %s (check $%s and network)\n' \
+            "$provider" "${models_auth_env:-?}"
+        return 0
+    fi
+    ids=$(printf '%s\n' "$json" | parse_model_ids)
+    if [[ -n $models_filter ]]; then
+        ids=$(printf '%s\n' "$ids" | grep -E "$models_filter")
+    fi
+    printf '%s\n' "$json" | write_context_map
+    printf '%s\n' "$json" | write_efforts_map
+    if [[ -z $ids ]]; then
+        [[ $mode == manual ]] && printf '  model refresh for %s returned no ids\n' "$provider"
+        return 0
+    fi
+    if [[ ! -s $known ]]; then
+        printf '%s\n' "$ids" >"$known" || return 0
+        [[ $mode == manual ]] && printf '  baseline saved: %s models known for %s\n' \
+            "$(wc -l <"$known")" "$provider"
+        return 0
+    fi
+    added=$(comm -13 <(sort -u "$known") <(printf '%s\n' "$ids" | sort -u))
+    touch "$known"
+    if [[ -n $added ]]; then
+        printf '%s\n' "$added" >>"$known"
+        printf '%s\n' "$added" >>"$extra"
+        printf '  new models detected for %s:%s\n' "$provider" "$(printf ' %s' $added)"
+    elif [[ $mode == manual ]]; then
+        printf '  no new models for %s\n' "$provider"
+    fi
+}
+
+maybe_auto_refresh() {
+    [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]] && return 0
+    local known="$CACHE_DIR/known__$provider"
+    if [[ ! -s $known || -n $(find "$known" -mmin +1440 2>/dev/null) ]]; then
+        refresh_models auto
+    fi
+}
+
+list_models() {
+    # $1 = suggested | all. conf models first, then discovered extras;
+    # dedup on the id with any [suffix] stripped.
+    local which=$1 m base
+    local disabled=" $(state_get "disabled__$provider" "") "
+    local -A seen=()
+    while IFS= read -r m; do
+        [[ -z $m ]] && continue
+        base=${m%%\[*}
+        [[ -n ${seen[$base]-} ]] && continue
+        seen[$base]=1
+        [[ $which == suggested && $disabled == *" $m "* ]] && continue
+        printf '%s\n' "$m"
+    done < <(
+        printf '%s\n' "${models[@]}"
+        [[ -s $CACHE_DIR/extra__$provider ]] && cat "$CACHE_DIR/extra__$provider"
+    )
+}
+
+# ------------------------------------------------- session header / info
+
+session_age() {
+    local mt now d
+    mt=$(stat -c %Y "$1" 2>/dev/null) || return 0
+    now=$(date +%s)
+    d=$((now - mt))
+    if ((d < 3600)); then printf '%dm ago' $((d / 60))
+    elif ((d < 86400)); then printf '%dh ago' $((d / 3600))
+    else printf '%dd ago' $((d / 86400)); fi
+}
+
+session_title() {
+    # Human title of session file $1: "ai-title" record, else last prompt.
+    local title
+    title=$(tac "$1" 2>/dev/null | grep -m1 '"type":"ai-title"' \
+        | jq -r '.aiTitle // empty' 2>/dev/null)
+    if [[ -z $title ]]; then
+        title=$(tac "$1" 2>/dev/null | grep -m1 '"type":"last-prompt"' \
+            | jq -r '.lastPrompt // empty' 2>/dev/null | cut -c1-60)
+    fi
+    [[ -n $title ]] || title="(untitled)"
+    printf '%s' "$title"
+}
+
+cwd_session_dir() {
+    printf '%s/.claude/projects/%s' "$HOME" "$(printf '%s' "$PWD" | tr '/.' '--')"
+}
+
+cwd_session_count() {
+    ls "$(cwd_session_dir)"/*.jsonl 2>/dev/null | wc -l
+}
+
+SESS_IDS=()
+SESS_INFO=()
+
+collect_sessions() {
+    # Newest up-to-4 sessions in this directory: [0] is what --continue
+    # resumes; [1..3] become direct resume rows.
+    local f i=0
+    SESS_IDS=()
+    SESS_INFO=()
+    command -v jq >/dev/null 2>&1 || return 0
+    while IFS= read -r f; do
+        SESS_IDS+=("$(basename "$f" .jsonl)")
+        SESS_INFO+=("$(session_title "$f") · $(session_age "$f")")
+        ((++i >= 4)) && break
+    done < <(ls -t "$(cwd_session_dir)"/*.jsonl 2>/dev/null)
+    CONT_INFO=${SESS_INFO[0]-}
+    RESUME_COUNT=$(cwd_session_count)
+}
+
+session_header() {
+    # Header line. This directory's newest session when one exists (same
+    # session the Continue row shows); otherwise the newest session
+    # anywhere, labeled with its project. Always prints a line.
+    local file label
+    command -v jq >/dev/null 2>&1 || { printf 'last session: (jq not installed)'; return 0; }
+    if [[ -n $CONT_INFO ]]; then
+        printf 'last session here: %s' "$CONT_INFO"
+        return 0
+    fi
+    file=$(ls -t "$HOME"/.claude/projects/*/*.jsonl 2>/dev/null | head -n1)
+    if [[ -z $file ]]; then
+        printf 'last session: none found'
+        return 0
+    fi
+    label=$(basename "$(dirname "$file")")
+    printf 'last session: %s · %s · in %s (not continuable here)' \
+        "$(session_title "$file")" "$(session_age "$file")" "${label#-}"
+}
+
+hooks_summary() {
+    # What the hooks toggle actually governs: hook event names, custom
+    # statusline, and plugin count from the settings files Claude Code
+    # loads here (disableAllHooks kills hooks + statusline).
+    command -v jq >/dev/null 2>&1 || return 0
+    local files=("$HOME/.claude/settings.json"
+                 "$PWD/.claude/settings.json"
+                 "$PWD/.claude/settings.local.json")
+    local f e out="" sl=0 plugins=0 p
+    local -A seen=()
+    for f in "${files[@]}"; do
+        [[ -r $f ]] || continue
+        for e in $(jq -r '.hooks // {} | keys[]' "$f" 2>/dev/null); do
+            [[ -n ${seen[$e]-} ]] && continue
+            seen[$e]=1
+            out+="${out:+,}$e"
+        done
+        [[ -n $(jq -r '.statusLine.command // empty' "$f" 2>/dev/null) ]] && sl=1
+        p=$(jq '.enabledPlugins // {} | length' "$f" 2>/dev/null) || p=0
+        [[ $p =~ ^[0-9]+$ ]] && plugins=$((plugins + p))
+    done
+    ((sl)) && out+="${out:+,}statusline"
+    ((plugins > 0)) && out+="${out:+,}${plugins} plugins"
+    printf '%s' "$out"
+}
+
+HOOKS_INFO=""
+HOOK_EVENTS=()
+USER_SETTINGS="${CLAUDE_LAUNCHER_USER_SETTINGS:-$HOME/.claude/settings.json}"
+
+collect_hook_events() {
+    # Hook events defined in the user settings file - the selectable set
+    # (plugin hooks and the statusline have no wrappable command).
+    HOOK_EVENTS=()
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -r $USER_SETTINGS ]] || return 0
+    mapfile -t HOOK_EVENTS < <(jq -r '.hooks // {} | keys[]' "$USER_SETTINGS" 2>/dev/null)
+}
+
+wrap_hooks() {
+    # One-time, idempotent: gate every hook command in the user settings
+    # file behind CLAUDE_HOOK_SKIP_<EVENT> so single events can be
+    # skipped per launch (no CLI mechanism exists: --settings hooks merge
+    # additively and disableAllHooks kills everything - both verified on
+    # 2.1.220). Backs up to settings.json.bak-launcher first.
+    local f=$USER_SETTINGS tmp
+    [[ -r $f ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    if ! jq -e '[.hooks // {} | to_entries[] | .value[].hooks[]?
+            | select(.type == "command")
+            | select((.command | startswith("[ -n \"${CLAUDE_HOOK_SKIP_")) | not)]
+            | length > 0' "$f" >/dev/null 2>&1; then
+        return 0
+    fi
+    cp -n "$f" "$f.bak-launcher" || return 1
+    tmp=$(mktemp) || return 1
+    if ! jq '.hooks |= with_entries(
+            ("CLAUDE_HOOK_SKIP_" + (.key | ascii_upcase)) as $var
+            | .value |= map(.hooks |= map(
+                if .type == "command"
+                   and ((.command | startswith("[ -n \"${CLAUDE_HOOK_SKIP_")) | not)
+                then .command = "[ -n \"${" + $var + ":-}\" ] && exit 0; " + .command
+                else . end)))' "$f" >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    jq -e '.hooks' "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$f"
+}
+
+hook_skip_env() {
+    # VAR=1 lines for skipped events; only meaningful while the master
+    # hooks toggle is on (off = disableAllHooks kills everything anyway).
+    local skips ev
+    [[ $(state_get hooks on) == on ]] || return 0
+    skips=$(state_get hooks_skip "")
+    for ev in $skips; do
+        printf 'CLAUDE_HOOK_SKIP_%s=1\n' "${ev^^}"
+    done
+}
+
+provider_missing_env() {
+    # rc 0 when provider $1 is usable; otherwise prints the missing env var.
+    # The subshell resets the fields first: it inherits the currently loaded
+    # provider's globals, and a conf that omits a field must not see them.
+    local vals env_name opt
+    vals=$(
+        auth_token_env=""
+        auth_optional=0
+        . "$PROVIDER_DIR/$1.conf" 2>/dev/null
+        printf '%s\n%s' "$auth_token_env" "$auth_optional"
+    )
+    env_name=${vals%%$'\n'*}
+    opt=${vals#*$'\n'}
+    [[ -z $env_name || $opt == 1 || -n ${!env_name-} ]] && return 0
+    printf '%s' "$env_name"
+    return 1
+}
+
+SESSION_HEADER=""
+INFO_LINE=""
+CONT_INFO=""
+RESUME_COUNT=0
+
+provider_info_line() {
+    # One line of provider account data from the conf's optional
+    # provider_info() hook. Cached for 15 minutes per provider.
+    local cache="$CACHE_DIR/info__$provider" out
+    declare -F provider_info >/dev/null || return 0
+    if [[ -s $cache && -z $(find "$cache" -mmin +15 2>/dev/null) ]]; then
+        cat "$cache"
+        return 0
+    fi
+    [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]] && return 0
+    mkdir -p "$CACHE_DIR"
+    out=$(provider_info 2>/dev/null) || out=""
+    printf '%s' "$out" >"$cache"
+    printf '%s' "$out"
+}
+
+PROVIDERS_LINE=""
+
+providers_line() {
+    # All configured providers on one line: current bracketed, keyless
+    # ones annotated with the env var they need.
+    local id line="" miss entry
+    for id in $(provider_ids); do
+        entry=$id
+        if ! miss=$(provider_missing_env "$id"); then
+            entry+=" (needs \$$miss)"
+        fi
+        [[ $id == "$provider" ]] && entry="[$entry]"
+        line+="${line:+ · }$entry"
+    done
+    printf '%s' "$line"
+}
+
+update_info_line() {
+    [[ ${1:-} == force ]] && rm -f "$CACHE_DIR/info__$provider"
+    INFO_LINE=$(provider_info_line)
+    PROVIDERS_LINE=$(providers_line)
+}
+
+# --------------------------------------------------------------- launch
+
+LAUNCH_ENV=()
+build_provider_env() {
+    # $1 = model. Result in LAUNCH_ENV.
+    LAUNCH_ENV=()
+    [[ -n $base_url ]] || return 0
+    local tok=""
+    [[ -n $auth_token_env ]] && tok="${!auth_token_env-}"
+    if [[ -z $tok && -n $auth_token_env ]]; then
+        if ((auth_optional)); then
+            printf 'claude-launcher: warning: $%s not set, contacting %s without auth\n' \
+                "$auth_token_env" "$base_url" >&2
+        else
+            die "provider '$provider' needs \$$auth_token_env exported (see $PROVIDER_DIR/$provider.conf)"
+        fi
+    fi
+    LAUNCH_ENV=("ANTHROPIC_BASE_URL=$base_url" "ANTHROPIC_MODEL=$1")
+    [[ -n $tok ]] && LAUNCH_ENV+=("$auth_var=$tok")
+    [[ -n $default_haiku_model ]] && LAUNCH_ENV+=("ANTHROPIC_DEFAULT_HAIKU_MODEL=$default_haiku_model")
+    ((${#extra_env[@]})) && LAUNCH_ENV+=("${extra_env[@]}")
+    return 0
+}
+
+TUNE_ENV=()
+build_tune_env() {
+    # $1 = resolved model. Launcher-computed environment for the launch.
+    #
+    #   CLAUDE_LAUNCHER_PROVIDER/HOME - always; lets the launcher
+    #     statusline locate the active provider's conf.
+    #   CLAUDE_CODE_MAX_OUTPUT_TOKENS - always (both native and
+    #     third-party). Separate from context: it caps generated output,
+    #     not input. CC defaults opus-4-8 to max_tokens 64000 and unknown
+    #     models to 32000 (wire-captured 2.1.220); the model's real
+    #     ceiling is 128000, so this lifts output to the documented cap.
+    #   CLAUDE_CODE_MAX_CONTEXT_TOKENS / CLAUDE_CODE_AUTO_COMPACT_WINDOW -
+    #     third-party providers ONLY. These pin the believed context
+    #     window (the INPUT cap) to the model's real size from the cached
+    #     listing. Native claude-* ids already carry a correct window in
+    #     CC's own registry (and mZc() ignores MAX_CONTEXT_TOKENS for
+    #     them, decompiled 2.1.220), so overriding from a <=24h-stale
+    #     cache there is pure downside. Third-party ids have no registry
+    #     entry and fall back to ber=200000, which is why kimi-k3 (1M)
+    #     was compacting at 200K.
+    TUNE_ENV=("CLAUDE_LAUNCHER_PROVIDER=$provider" "CLAUDE_LAUNCHER_HOME=$CL_HOME")
+    [[ -n $max_output_tokens ]] \
+        && TUNE_ENV+=("CLAUDE_CODE_MAX_OUTPUT_TOKENS=$max_output_tokens")
+    if [[ -n $base_url ]]; then
+        local ctx acw
+        ctx=$(model_context "$1")
+        if [[ $ctx =~ ^[0-9]+$ ]]; then
+            # AUTO_COMPACT_WINDOW is hard-capped at 1e6 by CC (Nds, U$e),
+            # which logs "Capped from N to 1000000" every launch above it;
+            # clamp here to avoid the noise. MAX_CONTEXT_TOKENS is read raw
+            # (no clamp) and drives the real window via Xv/mZc.
+            acw=$ctx
+            ((acw > 1000000)) && acw=1000000
+            TUNE_ENV+=("CLAUDE_CODE_MAX_CONTEXT_TOKENS=$ctx"
+                       "CLAUDE_CODE_AUTO_COMPACT_WINDOW=$acw")
+        fi
+    fi
+}
+
+preflight() {
+    [[ -n $base_url ]] || return 0
+    curl -s -o /dev/null --max-time 4 "$base_url" && return 0
+    local msg="provider '$provider' endpoint unreachable: $base_url"
+    [[ -n $preflight_hint ]] && msg+=$'\nclaude-launcher: '"$preflight_hint"
+    die "$msg"
+}
+
+run_claude() {
+    # $@ = claude args. Uses LAUNCH_ENV / TUNE_ENV / base_url set by caller.
+    local -a skip_env=()
+    mapfile -t skip_env < <(hook_skip_env)
+    if [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]]; then
+        local out="env" e a
+        [[ -n $base_url ]] && out+=" -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN"
+        if [[ -n $base_url ]]; then
+            for e in "${LAUNCH_ENV[@]}"; do out+=" $(printf '%q' "$e")"; done
+        fi
+        for e in "${TUNE_ENV[@]}" "${skip_env[@]}"; do out+=" $(printf '%q' "$e")"; done
+        out+=" $CLAUDE_BIN"
+        for a in "$@"; do out+=" $(printf '%q' "$a")"; done
+        printf '%s\n' "$out"
+        exit 0
+    fi
+    preflight
+    if [[ -n $base_url ]]; then
+        # Third-party endpoint: never leak the Anthropic credentials
+        # (platform.kimi.ai docs: remove ANTHROPIC_API_KEY to avoid conflicts).
+        exec env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+            "${LAUNCH_ENV[@]}" "${TUNE_ENV[@]}" "${skip_env[@]}" "$CLAUDE_BIN" "$@"
+    fi
+    exec env "${TUNE_ENV[@]}" "${skip_env[@]}" "$CLAUDE_BIN" "$@"
+}
+
+launch_session() {
+    # $1 = "" | --continue | --resume
+    local session_flag=$1
+    local model effort
+    model=$(resolve_model)
+    effort=$(resolve_effort)
+
+    local -a args=(--model "$model")
+    [[ -n $effort ]] && args+=(--effort "$effort")
+    # --settings payload. Two mutually exclusive cases:
+    #   hooks off -> {"disableAllHooks":true}. This documented key means
+    #     "Disable all hooks and custom status line", so it also kills any
+    #     statusline; injecting one here would be contradictory, and on
+    #     anthropic (hooks off) the settings.json statusline dies too.
+    #     Parity: hooks off means no statusline on any provider.
+    #   hooks on, third-party provider -> inject the launcher's
+    #     provider-aware statusline so account data reflects the actual
+    #     provider, not Anthropic's OAuth endpoint. Anthropic keeps its
+    #     own settings.json statusline untouched ("the same as anthropic
+    #     has"). --settings maps to the "flagSettings" source, which the
+    #     2.1.220 settings schema orders after user/project/local ("later
+    #     entries override earlier ones"), so it overrides settings.json's
+    #     statusLine; only an enterprise policy file outranks it.
+    local settings="" hooks_state
+    hooks_state=$(state_get hooks on)
+    if [[ $hooks_state == off ]]; then
+        settings='{"disableAllHooks":true}'
+    elif [[ -n $base_url && -x $CL_HOME/statusline.sh ]]; then
+        settings=$(jq -nc --arg c "$CL_HOME/statusline.sh" \
+            '{statusLine:{type:"command",command:$c}}')
+    fi
+    [[ -n $settings ]] && args+=(--settings "$settings")
+    [[ $(state_get safe off) == on ]] && args+=(--safe-mode)
+    if [[ $(state_get dtm off) == on ]]; then
+        [[ -r $system_prompt_file ]] || die "dtm prompt enabled but $system_prompt_file is unreadable"
+        case $system_prompt_mode in
+            replace) args+=(--system-prompt-file "$system_prompt_file") ;;
+            append)  args+=(--append-system-prompt-file "$system_prompt_file") ;;
+            *) die "system_prompt_mode must be replace or append (got '$system_prompt_mode')" ;;
+        esac
+    fi
+    [[ -n $session_flag ]] && args+=("$session_flag")
+
+    build_provider_env "$model"
+    build_tune_env "$model"
+    run_claude "${args[@]}"
+}
+
+# ---------------------------------------------------------- passthrough
+
+passthrough() {
+    local first=$1 sc
+    for sc in "${SUBCOMMANDS[@]}"; do
+        if [[ $first == "$sc" ]]; then
+            if [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]]; then
+                local out=$CLAUDE_BIN a
+                for a in "$@"; do out+=" $(printf '%q' "$a")"; done
+                printf '%s\n' "$out"
+                exit 0
+            fi
+            exec "$CLAUDE_BIN" "$@"
+        fi
+    done
+
+    local has_model=0 has_effort=0 a
+    for a in "$@"; do
+        case $a in
+            --model|--model=*)   has_model=1 ;;
+            --effort|--effort=*) has_effort=1 ;;
+        esac
+    done
+    local model effort
+    model=$(resolve_model)
+    effort=$(resolve_effort)
+    local -a args=()
+    ((has_model)) || args+=(--model "$model")
+    if ((!has_effort)) && [[ -n $effort ]]; then
+        args+=(--effort "$effort")
+    fi
+    args+=("$@")
+    build_provider_env "$model"
+    build_tune_env "$model"
+    run_claude "${args[@]}"
+}
+
+# ----------------------------------------------------------------- menu
+
+toggle() {
+    local key=$1 def=$2 cur
+    cur=$(state_get "$key" "$def")
+    if [[ $cur == on ]]; then state_set "$key" off; else state_set "$key" on; fi
+}
+
+pick_model() {
+    local -a sug=()
+    local i sel
+    mapfile -t sug < <(list_models suggested)
+    printf '\n  models (%s):\n' "$name"
+    for i in "${!sug[@]}"; do
+        printf '    %d) %s\n' "$((i + 1))" "${sug[$i]}"
+    done
+    printf '    o) other (type a model string)\n'
+    printf '    x) enable/disable suggestions\n  model> '
+    read -r sel || return 0
+    case $sel in
+        o)
+            printf '  model string> '
+            read -r sel || return 0
+            ;;
+        x)
+            manage_models
+            return 0
+            ;;
+        *)
+            if [[ $sel =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= ${#sug[@]})); then
+                sel=${sug[$((sel - 1))]}
+            else
+                return 0
+            fi
+            ;;
+    esac
+    [[ -n $sel ]] && state_set "model__$provider" "$sel"
+}
+
+flip_model_disabled() {
+    local m=$1 disabled
+    disabled=" $(state_get "disabled__$provider" "") "
+    if [[ $disabled == *" $m "* ]]; then
+        disabled=${disabled/" $m "/ }
+    else
+        disabled+="$m "
+    fi
+    state_set "disabled__$provider" "$(normalize_ws "$disabled")"
+}
+
+manage_models() {
+    local -a all=()
+    local disabled sel m mark i
+    while :; do
+        mapfile -t all < <(list_models all)
+        disabled=" $(state_get "disabled__$provider" "") "
+        printf '\n  toggle model suggestions (%s), enter to finish:\n' "$provider"
+        for i in "${!all[@]}"; do
+            m=${all[$i]}
+            if [[ $disabled == *" $m "* ]]; then mark="off"; else mark="on "; fi
+            printf '    %d) [%s] %s\n' "$((i + 1))" "$mark" "$m"
+        done
+        printf '  toggle> '
+        read -r sel || return 0
+        [[ -z $sel ]] && return 0
+        [[ $sel =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= ${#all[@]})) || continue
+        flip_model_disabled "${all[$((sel - 1))]}"
+    done
+}
+
+pick_provider() {
+    local ids=() i sel n miss
+    mapfile -t ids < <(provider_ids)
+    printf '\n  providers:\n'
+    for i in "${!ids[@]}"; do
+        n=$(. "$PROVIDER_DIR/${ids[$i]}.conf" 2>/dev/null; printf '%s' "${name:-}")
+        miss=$(provider_missing_env "${ids[$i]}") \
+            && printf '    %d) %-10s %s\n' "$((i + 1))" "${ids[$i]}" "$n" \
+            || printf '    %d) %-10s %s (needs $%s)\n' "$((i + 1))" "${ids[$i]}" "$n" "$miss"
+    done
+    printf '  provider> '
+    read -r sel || return 0
+    if [[ $sel =~ ^[0-9]+$ ]] && ((sel >= 1 && sel <= ${#ids[@]})); then
+        if ! miss=$(provider_missing_env "${ids[$((sel - 1))]}"); then
+            printf '  export $%s first\n' "$miss"
+            return 0
+        fi
+        provider=${ids[$((sel - 1))]}
+        state_set provider "$provider"
+        load_provider "$provider"
+        maybe_auto_refresh
+    fi
+}
+
+cycle_effort() {
+    local cur i
+    cur=$(state_get effort max)
+    for i in "${!EFFORTS[@]}"; do
+        if [[ ${EFFORTS[$i]} == "$cur" ]]; then
+            state_set effort "${EFFORTS[$(((i + 1) % ${#EFFORTS[@]}))]}"
+            return
+        fi
+    done
+    state_set effort max
+}
+
+render() {
+    local k mval hid
+    printf '\nclaude-launcher\n'
+    [[ -n $SESSION_HEADER ]] && printf '  %s\n' "$SESSION_HEADER"
+    [[ -n $INFO_LINE ]] && printf '  %s: %s\n' "$provider" "$INFO_LINE"
+    printf '  providers   %s\n' "$PROVIDERS_LINE"
+    [[ -n $CONT_INFO ]] && printf '  continue    %s  [c]\n' "$CONT_INFO"
+    for k in 1 2 3; do
+        [[ -n ${SESS_INFO[$k]-} ]] && printf '  resume      %s  [%s]\n' "${SESS_INFO[$k]}" "$k"
+    done
+    ((RESUME_COUNT > 4)) && printf '  resume      picker, %s sessions total  [r]\n' "$RESUME_COUNT"
+    printf '  provider    %-32s [p]\n' "$provider ($name)"
+    local mval hid=()
+    mval=$(resolve_model)
+    read -ra hid <<< "$(state_get "disabled__$provider" "")"
+    ((${#hid[@]})) && mval+=" · ${#hid[@]} hidden"
+    printf '  model       %-32s [m]\n' "$mval"
+    printf '  effort      %-32s [e]\n' "$(resolve_effort)"
+    printf '  hooks       %-32s [h]\n' "$(state_get hooks on)${HOOKS_INFO:+ ($HOOKS_INFO)}"
+    printf '  dtm prompt  %-32s [s]\n' "$(state_get dtm off)"
+    printf '  safe mode   %-32s [v]  (CLAUDE.md, hooks, plugins, skills all off)\n' "$(state_get safe off)"
+    printf '\n  [enter/f] fresh   [c] continue   [r] resume picker\n'
+    printf '  [u] refresh models   [q] quit\n'
+}
+
+menu_plain() {
+    local key
+    maybe_auto_refresh
+    collect_sessions
+    collect_hook_events
+    SESSION_HEADER=$(session_header)
+    HOOKS_INFO=$(hooks_summary)
+    update_info_line
+    while :; do
+        render
+        printf '> '
+        IFS= read -rsn1 key || { printf '\n'; exit 1; }
+        printf '\n'
+        case $key in
+            '' | f) launch_session "" ;;
+            c)
+                if [[ -n $CONT_INFO ]]; then
+                    launch_session --continue
+                else
+                    printf '  no session to continue in this directory\n'
+                fi
+                ;;
+            r)      launch_session --resume ;;
+            [123])
+                [[ -n ${SESS_IDS[$key]-} ]] && launch_session "--resume=${SESS_IDS[$key]}"
+                ;;
+            p)      pick_provider; update_info_line ;;
+            m)      pick_model ;;
+            e)      cycle_effort_dir 1 ;;
+            u)      refresh_models manual; update_info_line force ;;
+            h)      toggle hooks on ;;
+            s)      toggle dtm off ;;
+            v)      toggle safe off ;;
+            q)      exit 0 ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------- tui menu
+
+# Interactive arrow-key menu, used when stdin/stdout is a terminal.
+# Falls back to menu_plain over pipes and dumb terminals.
+
+supports_tui() {
+    [[ -t 0 && -t 1 ]] || return 1
+    [[ ${TERM:-dumb} != dumb ]] || return 1
+    command -v tput >/dev/null 2>&1 || return 1
+    tput cuu 1 >/dev/null 2>&1 || return 1
+    return 0
+}
+
+C_RESET="" C_BOLD="" C_DIM="" C_REV="" C_TITLE="" C_ON=""
+init_colors() {
+    [[ -n ${NO_COLOR:-} ]] && return 0
+    local n
+    n=$(tput colors 2>/dev/null) || n=0
+    ((n >= 8)) || return 0
+    C_RESET=$(tput sgr0) C_BOLD=$(tput bold) C_DIM=$(tput dim) C_REV=$(tput rev)
+    # Daltonized-safe accents: blue/cyan, never a bare red/green split.
+    C_TITLE=$(tput setaf 4)
+    C_ON=$(tput setaf 6)
+}
+
+TUI_ACTIVE=0
+TUI_MSG=""
+MARKER='>'
+[[ ${LC_ALL:-${LANG:-}} == *[Uu][Tt][Ff]-8* || ${LC_ALL:-${LANG:-}} == *[Uu][Tt][Ff]8* ]] && MARKER='❯'
+
+# Inline rendering: the menu draws in the normal screen buffer below the
+# shell prompt (no alternate screen), redraws in place with relative
+# cursor moves, and erases itself on exit. Scrollback stays intact.
+CUR_DRAW_LINES=0
+TUI_OUT=()
+
+tui_render() {
+    local el n i extra
+    el=$(tput el)
+    n=${#TUI_OUT[@]}
+    ((CUR_DRAW_LINES > 0)) && tput cuu "$CUR_DRAW_LINES"
+    printf '\r'
+    for i in "${!TUI_OUT[@]}"; do
+        printf '%s%s\n' "${TUI_OUT[$i]}" "$el"
+    done
+    if ((CUR_DRAW_LINES > n)); then
+        extra=$((CUR_DRAW_LINES - n))
+        for ((i = 0; i < extra; i++)); do printf '%s\n' "$el"; done
+        tput cuu "$extra"
+    fi
+    CUR_DRAW_LINES=$n
+}
+
+tui_erase() {
+    ((CUR_DRAW_LINES > 0)) || return 0
+    tput cuu "$CUR_DRAW_LINES"
+    printf '\r'
+    tput ed
+    CUR_DRAW_LINES=0
+}
+
+tui_setup() {
+    tput civis 2>/dev/null
+    TUI_ACTIVE=1
+    trap tui_teardown EXIT
+    trap 'exit 130' INT TERM
+}
+
+tui_teardown() {
+    ((TUI_ACTIVE)) || return 0
+    TUI_ACTIVE=0
+    tui_erase
+    tput cnorm 2>/dev/null
+}
+
+KEY=""
+tui_read_key() {
+    local k extra
+    IFS= read -rsn1 k || return 1
+    if [[ $k == $'\e' ]]; then
+        while IFS= read -rsn1 -t 0.01 extra; do
+            k+=$extra
+            case $k in $'\e['[A-Za-z~]) break ;; esac
+            ((${#k} >= 8)) && break
+        done
+    fi
+    KEY=$k
+    return 0
+}
+
+tui_row_label() {
+    case $1 in
+        fresh)    printf 'Start fresh' ;;
+        continue) printf 'Continue' ;;
+        resume1)  printf 'Resume' ;;
+        resume2 | resume3) printf ' ' ;;
+        resume)   printf 'All sessions' ;;
+        provider) printf 'Provider' ;;
+        model)    printf 'Model' ;;
+        effort)   printf 'Effort' ;;
+        hooks)    printf 'Hooks' ;;
+        dtm)      printf 'DTM prompt' ;;
+        safe)     printf 'Safe mode' ;;
+        refresh)  printf 'Refresh models now' ;;
+        quit)     printf 'Quit' ;;
+    esac
+}
+
+tui_row_adjustable() {
+    case $1 in
+        provider | model | effort | hooks | dtm | safe) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+tui_row_value() {
+    local v
+    case $1 in
+        continue) printf '%.56s' "$CONT_INFO" ;;
+        resume1 | resume2 | resume3)
+            printf '%.56s' "${SESS_INFO[${1#resume}]-}"
+            ;;
+        resume)   printf 'picker · %s sessions total' "$RESUME_COUNT" ;;
+        provider) printf '%s (%s)' "$provider" "$name" ;;
+        model)
+            v=$(resolve_model)
+            local hid=()
+            read -ra hid <<< "$(state_get "disabled__$provider" "")"
+            ((${#hid[@]})) && v+=" · ${#hid[@]} hidden"
+            printf '%s' "$v"
+            ;;
+        effort)
+            v=$(resolve_effort)
+            printf '%s' "${v:--}"
+            ;;
+        hooks)
+            v=$(state_get hooks on)
+            local skips
+            skips=$(state_get hooks_skip "")
+            if [[ $v == on && -n $skips ]]; then
+                printf 'on, skipping: %s' "$skips"
+            else
+                printf '%s%s' "$v" "${HOOKS_INFO:+ · $HOOKS_INFO}"
+            fi
+            ;;
+        dtm)      state_get dtm off ;;
+        safe)     state_get safe off ;;
+    esac
+}
+
+tui_draw() {
+    local sel=$1 i id label value line
+    TUI_OUT=("  ${C_BOLD}${C_TITLE}claude-launcher${C_RESET}")
+    [[ -n $SESSION_HEADER ]] && TUI_OUT+=("  ${C_DIM}${SESSION_HEADER}${C_RESET}")
+    [[ -n $INFO_LINE ]] && TUI_OUT+=("  ${C_DIM}${provider}: ${INFO_LINE}${C_RESET}")
+    TUI_OUT+=("  ${C_DIM}providers: ${PROVIDERS_LINE}${C_RESET}")
+    TUI_OUT+=("")
+    for i in "${!TUI_ROWS[@]}"; do
+        id=${TUI_ROWS[$i]}
+        label=$(tui_row_label "$id")
+        value=$(tui_row_value "$id")
+        case $id in
+            provider | refresh) TUI_OUT+=("") ;;   # group separators
+        esac
+        if [[ -n $value ]]; then
+            if [[ $value == on ]]; then
+                value="${C_ON}${value}${C_RESET}"
+            elif [[ $value == off ]]; then
+                value="${C_DIM}${value}${C_RESET}"
+            fi
+            line=$(printf '%-12s %s' "$label" "$value")
+        else
+            line=$label
+        fi
+        if ((i == sel)); then
+            if [[ -n $value ]] && tui_row_adjustable "$id"; then
+                TUI_OUT+=(" ${C_REV} ${MARKER} $(printf '%-12s' "$label")${C_RESET} ${C_DIM}‹${C_RESET} ${value} ${C_DIM}›${C_RESET}")
+            elif [[ -n $value ]]; then
+                TUI_OUT+=(" ${C_REV} ${MARKER} $(printf '%-12s' "$label")${C_RESET} ${value}")
+            else
+                TUI_OUT+=(" ${C_REV} ${MARKER} ${label} ${C_RESET}")
+            fi
+        else
+            TUI_OUT+=("    ${line}")
+        fi
+    done
+    TUI_OUT+=("")
+    TUI_OUT+=("  ${C_DIM}up/down move   left/right change   enter select   q quit${C_RESET}")
+    [[ -n $TUI_MSG ]] && TUI_OUT+=("  ${C_DIM}${TUI_MSG}${C_RESET}")
+    tui_render
+}
+
+cycle_effort_dir() {
+    local dir=$1 cur i n opts=()
+    mapfile -t opts < <(effort_options)
+    n=${#opts[@]}
+    ((n)) || return 0
+    cur=$(resolve_effort)
+    i=0
+    local j
+    for j in "${!opts[@]}"; do
+        [[ ${opts[$j]} == "$cur" ]] && { i=$j; break; }
+    done
+    state_set effort "${opts[$(((i + n + dir) % n))]}"
+}
+
+cycle_provider() {
+    local dir=$1 ids=() i j cand n
+    mapfile -t ids < <(provider_ids)
+    n=${#ids[@]}
+    ((n)) || return 0
+    for i in "${!ids[@]}"; do
+        [[ ${ids[$i]} == "$provider" ]] && break
+    done
+    for ((j = 1; j <= n; j++)); do
+        cand=${ids[$(((i + n + dir * j) % n))]}
+        provider_missing_env "$cand" >/dev/null || continue
+        provider=$cand
+        state_set provider "$provider"
+        load_provider "$provider"
+        TUI_MSG=$(maybe_auto_refresh)
+        update_info_line
+        return 0
+    done
+}
+
+cycle_model() {
+    local dir=$1 sug=() cur i j n
+    mapfile -t sug < <(list_models suggested)
+    n=${#sug[@]}
+    ((n)) || return 0
+    cur=$(current_model "$provider")
+    i=-1
+    for j in "${!sug[@]}"; do
+        [[ ${sug[$j]} == "$cur" ]] && { i=$j; break; }
+    done
+    if ((i < 0)); then i=0; else i=$(((i + n + dir) % n)); fi
+    state_set "model__$provider" "${sug[$i]}"
+}
+
+tui_adjust() {
+    case $1 in
+        provider)       cycle_provider "$2" ;;
+        model)          cycle_model "$2" ;;
+        effort)         cycle_effort_dir "$2" ;;
+        hooks)          toggle hooks on ;;
+        dtm)            toggle dtm off ;;
+        safe)           toggle safe off ;;
+        fresh | continue | resume | resume[123] | refresh | quit)
+            [[ $2 == 1 ]] && tui_enter "$1" ;;
+    esac
+}
+
+TUI_CHOICE=-1
+TUI_KEY=""
+tui_select() {
+    # Arrow-key list picker: $1 = title, $2 = extra hotkeys (string of
+    # chars, may be empty), $3 = initial selection, rest = items.
+    # Returns 0 with TUI_CHOICE set and TUI_KEY = "" (enter) or the extra
+    # hotkey pressed; 1 on cancel (q / esc / EOF).
+    local title=$1 extra=$2 sel=$3
+    shift 3
+    local -a items=("$@")
+    local n=${#items[@]} i hint
+    ((n)) || return 1
+    ((sel >= 0 && sel < n)) || sel=0
+    hint="  ${C_DIM}up/down move   enter select"
+    [[ -n $extra ]] && hint+="   $extra toggle"
+    hint+="   q back${C_RESET}"
+    while :; do
+        TUI_OUT=("  ${C_BOLD}${C_TITLE}${title}${C_RESET}" "")
+        for i in "${!items[@]}"; do
+            if ((i == sel)); then
+                TUI_OUT+=(" ${C_REV} ${MARKER} ${items[$i]} ${C_RESET}")
+            else
+                TUI_OUT+=("    ${items[$i]}")
+            fi
+        done
+        TUI_OUT+=("" "$hint")
+        tui_render
+        tui_read_key || return 1
+        case $KEY in
+            $'\e[A' | k) sel=$(((sel + n - 1) % n)) ;;
+            $'\e[B' | j) sel=$(((sel + 1) % n)) ;;
+            '')          TUI_CHOICE=$sel; TUI_KEY=""; return 0 ;;
+            q | $'\e')   return 1 ;;
+            *)
+                if [[ -n $extra && $extra == *"$KEY"* ]]; then
+                    TUI_CHOICE=$sel
+                    TUI_KEY=$KEY
+                    return 0
+                fi
+                ;;
+        esac
+    done
+}
+
+tui_pick_provider() {
+    local -a ids=() items=()
+    local i pname miss
+    mapfile -t ids < <(provider_ids)
+    for i in "${!ids[@]}"; do
+        pname=$(. "$PROVIDER_DIR/${ids[$i]}.conf" 2>/dev/null; printf '%s' "${name:-}")
+        if miss=$(provider_missing_env "${ids[$i]}"); then
+            items+=("$(printf '%-10s %s' "${ids[$i]}" "$pname")")
+        else
+            items+=("$(printf '%-10s %s (needs $%s)' "${ids[$i]}" "$pname" "$miss")")
+        fi
+    done
+    tui_select "provider" "" 0 "${items[@]}" || return 0
+    if ! miss=$(provider_missing_env "${ids[$TUI_CHOICE]}"); then
+        TUI_MSG="export \$$miss to use ${ids[$TUI_CHOICE]}"
+        return 0
+    fi
+    provider=${ids[$TUI_CHOICE]}
+    state_set provider "$provider"
+    load_provider "$provider"
+    TUI_MSG=$(maybe_auto_refresh)
+    update_info_line
+}
+
+tui_pick_model() {
+    # One flat list: enter selects, x marks a model disabled inline
+    # (dimmed, excluded from left/right cycling), no sub-menu.
+    local -a all=() items=()
+    local m disabled sel=0
+    while :; do
+        mapfile -t all < <(list_models all)
+        disabled=" $(state_get "disabled__$provider" "") "
+        items=()
+        for m in "${all[@]}"; do
+            if [[ $disabled == *" $m "* ]]; then
+                items+=("${C_DIM}✗ ${m}${C_RESET}")
+            else
+                items+=("  $m")
+            fi
+        done
+        items+=("  other (type a model string)")
+        tui_select "model ($name)" "x" "$sel" "${items[@]}" || return 0
+        sel=$TUI_CHOICE
+        if [[ $TUI_KEY == x ]]; then
+            ((TUI_CHOICE < ${#all[@]})) && flip_model_disabled "${all[$TUI_CHOICE]}"
+            continue
+        fi
+        if ((TUI_CHOICE < ${#all[@]})); then
+            m=${all[$TUI_CHOICE]}
+            # picking a disabled model re-enables it
+            [[ $disabled == *" $m "* ]] && flip_model_disabled "$m"
+            state_set "model__$provider" "$m"
+            return 0
+        fi
+        tui_erase
+        tput cnorm 2>/dev/null
+        printf '  model string> '
+        IFS= read -r m || m=""
+        printf '\r'
+        tput cuu 1 2>/dev/null
+        tput ed 2>/dev/null
+        tput civis 2>/dev/null
+        if [[ -n $m ]]; then
+            state_set "model__$provider" "$m"
+            return 0
+        fi
+    done
+}
+
+tui_launch() {
+    tui_teardown
+    launch_session "$1"
+}
+
+tui_enter() {
+    case $1 in
+        fresh)    tui_launch "" ;;
+        continue) tui_launch --continue ;;
+        resume)   tui_launch --resume ;;
+        resume[123])
+            local idx=${1#resume}
+            [[ -n ${SESS_IDS[$idx]-} ]] && tui_launch "--resume=${SESS_IDS[$idx]}"
+            ;;
+        provider) tui_pick_provider ;;
+        model)    tui_pick_model ;;
+        effort)   cycle_effort_dir 1 ;;
+        hooks)    tui_pick_hooks ;;
+        dtm)      toggle dtm off ;;
+        safe)     toggle safe off ;;
+        refresh)  TUI_MSG=$(refresh_models manual); update_info_line force ;;
+        quit)     tui_teardown; exit 0 ;;
+    esac
+}
+
+tui_pick_hooks() {
+    # Per-event skip editor: enter toggles the highlighted event.
+    # Left/right on the Hooks row still flips the master toggle.
+    local -a items=()
+    local skips ev sel=0
+    if ((${#HOOK_EVENTS[@]} == 0)); then
+        TUI_MSG="no hook events found in $USER_SETTINGS"
+        return 0
+    fi
+    while :; do
+        skips=" $(state_get hooks_skip "") "
+        items=()
+        for ev in "${HOOK_EVENTS[@]}"; do
+            if [[ $skips == *" $ev "* ]]; then
+                items+=("${C_DIM}✗ ${ev}${C_RESET}")
+            else
+                items+=("  $ev")
+            fi
+        done
+        tui_select "hooks · enter toggles (statusline+plugins follow the master toggle)" \
+            "" "$sel" "${items[@]}" || return 0
+        sel=$TUI_CHOICE
+        ev=${HOOK_EVENTS[$TUI_CHOICE]}
+        if [[ $skips == *" $ev "* ]]; then
+            skips=${skips/" $ev "/ }
+        else
+            if ! wrap_hooks; then
+                TUI_MSG="cannot wrap hook commands in $USER_SETTINGS"
+                return 0
+            fi
+            skips+="$ev "
+        fi
+        state_set hooks_skip "$(normalize_ws "$skips")"
+    done
+}
+
+TUI_ROWS=()
+
+menu_tui() {
+    local sel=0 n k
+    TUI_MSG=$(maybe_auto_refresh)
+    collect_sessions
+    collect_hook_events
+    SESSION_HEADER=$(session_header)
+    HOOKS_INFO=$(hooks_summary)
+    update_info_line
+    TUI_ROWS=(fresh)
+    [[ -n $CONT_INFO ]] && TUI_ROWS+=(continue)
+    for k in 1 2 3; do
+        [[ -n ${SESS_IDS[$k]-} ]] && TUI_ROWS+=("resume$k")
+    done
+    ((RESUME_COUNT > 4)) && TUI_ROWS+=(resume)
+    TUI_ROWS+=(provider model effort hooks dtm safe refresh quit)
+    n=${#TUI_ROWS[@]}
+    init_colors
+    tui_setup
+    while :; do
+        tui_draw "$sel"
+        if ! tui_read_key; then
+            tui_teardown
+            exit 1
+        fi
+        case $KEY in
+            $'\e[A' | k) sel=$(((sel + n - 1) % n)) ;;
+            $'\e[B' | j) sel=$(((sel + 1) % n)) ;;
+            $'\e[D')     tui_adjust "${TUI_ROWS[$sel]}" -1 ;;
+            $'\e[C')     tui_adjust "${TUI_ROWS[$sel]}" 1 ;;
+            '')          tui_enter "${TUI_ROWS[$sel]}" ;;
+            f)           tui_launch "" ;;
+            c)           tui_launch --continue ;;
+            r)           tui_launch --resume ;;
+            p)           tui_pick_provider ;;
+            m)           tui_pick_model ;;
+            e)           cycle_effort_dir 1 ;;
+            u)           TUI_MSG=$(refresh_models manual); update_info_line force ;;
+            h)           toggle hooks on ;;
+            s)           toggle dtm off ;;
+            v)           toggle safe off ;;
+            q)           tui_teardown; exit 0 ;;
+        esac
+    done
+}
+
+# ----------------------------------------------------------------- main
+
+seed_files
+load_config
+load_state
+
+CLAUDE_BIN=${claude_bin:-$(type -P claude || true)}
+[[ -n $CLAUDE_BIN ]] || die "no claude binary found in PATH; set claude_bin in $CONFIG_FILE"
+if [[ $(readlink -f "$CLAUDE_BIN") == $(readlink -f "$0") ]]; then
+    die "claude in PATH resolves to this launcher; set claude_bin in $CONFIG_FILE"
+fi
+
+provider=$(state_get provider anthropic)
+if [[ ! -r $PROVIDER_DIR/$provider.conf ]]; then
+    printf 'claude-launcher: provider %s no longer exists, using anthropic\n' "$provider" >&2
+    provider=anthropic
+    state_set provider "$provider"
+fi
+load_provider "$provider"
+
+# First run: remember the old alias defaults.
+[[ -e $STATE_FILE ]] || {
+    STATE[provider]=$provider
+    STATE[effort]=max
+    STATE[model__anthropic]="claude-opus-4-8[1m]"
+    save_state
+}
+
+if (($#)); then
+    passthrough "$@"
+elif supports_tui; then
+    menu_tui
+else
+    menu_plain
+fi
