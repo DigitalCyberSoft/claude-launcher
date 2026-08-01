@@ -179,15 +179,24 @@ provider_info() {
 EOF
 
     [[ -e $PROVIDER_DIR/openai.conf ]] || cat >"$PROVIDER_DIR/openai.conf" <<'EOF'
-# OpenAI via the local LiteLLM proxy (OpenAI serves no Anthropic-compatible
-# endpoint, verified 2026-08 against developers.openai.com). Proxy setup:
-#   pip install 'litellm[proxy]'
-#   litellm --config $CL_HOME/litellm.yaml
-name="OpenAI (via LiteLLM)"
-base_url="http://127.0.0.1:4000"
-auth_token_env="LITELLM_MASTER_KEY"
-auth_optional=1
-preflight_hint="start the proxy: litellm --config $CL_HOME/litellm.yaml"
+# OpenAI, reached through a LiteLLM proxy the launcher starts per session
+# on an ephemeral port (OpenAI serves no Anthropic-compatible endpoint,
+# verified 2026-08 against developers.openai.com). No proxy to start by
+# hand: managed_proxy=1 makes the launcher spin one up for the session and
+# tear it down on exit. Needs litellm[proxy] (auto-installed on first use)
+# and OPENAI_API_KEY exported.
+name="OpenAI"
+# base_url is set to the ephemeral proxy port at launch; the value here is
+# only a placeholder so build_provider_env treats this as a third-party
+# provider before the proxy starts.
+base_url="managed"
+managed_proxy=1
+proxy_route="openai"          # LiteLLM model prefix (openai/<id>)
+proxy_key_env="OPENAI_API_KEY"
+# The auth token handed to claude for the local proxy: the proxy runs
+# keyless, so this is a dummy that is never checked.
+auth_token_env="OPENAI_API_KEY"
+auth_var="ANTHROPIC_AUTH_TOKEN"
 # OpenAI's /v1/models carries no context/output metadata (id/created/
 # owned_by only, checked 2026-08-02), so context is declared per model
 # here rather than discovered. context_map drives auto [1m] and the
@@ -210,7 +219,10 @@ gpt-5.3-codex low,medium,high,xhigh
 "
 # max_tokens ceiling 128000 for both (developers.openai.com, 2026-08-02).
 max_output_tokens=128000
-models_url="http://127.0.0.1:4000/v1/models"
+# Discovery hits OpenAI directly (the per-session proxy is not running at
+# menu time). The vendor listing tolerates the launcher's header set.
+models_url="https://api.openai.com/v1/models"
+models_auth_env="OPENAI_API_KEY"
 models_filter="^(gpt|o[0-9])"
 models=(
     "gpt-5.6-sol"
@@ -218,40 +230,30 @@ models=(
 )
 # OpenAI exposes no balance to normal API keys (credit_grants needs a
 # browser session key; the Costs API needs an admin key) - checked
-# 2026-08-01 - so this reports proxy health and key validity only.
+# 2026-08-01 - so this reports key validity only.
 provider_info() {
-    local out n
-    if n=$(curl -sf --max-time 4 "$models_url" | jq -r '.data | length' 2>/dev/null) \
-        && [[ $n =~ ^[0-9]+$ ]]; then
-        out="proxy up · $n models"
+    [[ -n ${OPENAI_API_KEY-} ]] || { printf 'OPENAI_API_KEY unset'; return 0; }
+    if curl -sf --max-time 4 -o /dev/null https://api.openai.com/v1/models \
+        -H "authorization: Bearer $OPENAI_API_KEY" 2>/dev/null; then
+        printf 'key ok · proxy started per session'
     else
-        out="proxy down"
+        printf 'key FAILED'
     fi
-    if [[ -n ${OPENAI_API_KEY-} ]]; then
-        if curl -sf --max-time 4 -o /dev/null https://api.openai.com/v1/models \
-            -H "authorization: Bearer $OPENAI_API_KEY" 2>/dev/null; then
-            out+=" · openai key ok"
-        else
-            out+=" · openai key FAILED"
-        fi
-    else
-        out+=" · OPENAI_API_KEY unset"
-    fi
-    printf '%s' "$out"
 }
 EOF
 
     [[ -e $PROVIDER_DIR/grok.conf ]] || cat >"$PROVIDER_DIR/grok.conf" <<'EOF'
-# Grok via the local LiteLLM proxy (xAI's current API serves no
-# Anthropic-compatible endpoint, verified 2026-08 against docs.x.ai).
-# Proxy setup:
-#   pip install 'litellm[proxy]'
-#   litellm --config $CL_HOME/litellm.yaml
-name="Grok (via LiteLLM)"
-base_url="http://127.0.0.1:4000"
-auth_token_env="LITELLM_MASTER_KEY"
-auth_optional=1
-preflight_hint="start the proxy: litellm --config $CL_HOME/litellm.yaml"
+# Grok, reached through a LiteLLM proxy the launcher starts per session on
+# an ephemeral port (xAI's current API serves no Anthropic-compatible
+# endpoint, verified 2026-08 against docs.x.ai). No proxy to start by hand.
+# Needs litellm[proxy] (auto-installed on first use) and XAI_API_KEY.
+name="Grok"
+base_url="managed"
+managed_proxy=1
+proxy_route="xai"             # LiteLLM model prefix (xai/<id>)
+proxy_key_env="XAI_API_KEY"
+auth_token_env="XAI_API_KEY"
+auth_var="ANTHROPIC_AUTH_TOKEN"
 # xAI's /v1/language-models carries pricing + long_context_threshold but
 # no context-window or output field (checked 2026-08-02), so context is
 # declared per model. Windows from docs.x.ai models page, 2026-08-02
@@ -275,7 +277,10 @@ grok-4.3 low,medium,high,xhigh
 # xAI publishes no explicit max-output cap and the API silently clamps an
 # oversized max_tokens (checked 2026-08-02); leave unset so Claude Code
 # uses its own default rather than assert an unsourced number.
-models_url="http://127.0.0.1:4000/v1/models"
+# Discovery hits xAI directly (the per-session proxy is not running at
+# menu time).
+models_url="https://api.x.ai/v1/models"
+models_auth_env="XAI_API_KEY"
 models_filter="^grok"
 models=(
     "grok-4.5"
@@ -283,31 +288,26 @@ models=(
     "grok-4.3"
 )
 provider_info() {
-    local out n blocked
-    if n=$(curl -sf --max-time 4 "$models_url" | jq -r '.data | length' 2>/dev/null) \
-        && [[ $n =~ ^[0-9]+$ ]]; then
-        out="proxy up · $n models"
-    else
-        out="proxy down"
-    fi
-    if [[ -n ${XAI_API_KEY-} ]]; then
-        blocked=$(curl -sf --max-time 4 https://api.x.ai/v1/api-key \
-            -H "authorization: Bearer $XAI_API_KEY" 2>/dev/null \
-            | jq -r '.api_key_blocked' 2>/dev/null)
-        case $blocked in
-            false) out+=" · xai key ok" ;;
-            true)  out+=" · xai key BLOCKED" ;;
-            *)     out+=" · xai key unreachable" ;;
-        esac
-    else
-        out+=" · XAI_API_KEY unset"
-    fi
-    printf '%s' "$out"
+    local blocked
+    [[ -n ${XAI_API_KEY-} ]] || { printf 'XAI_API_KEY unset'; return 0; }
+    blocked=$(curl -sf --max-time 4 https://api.x.ai/v1/api-key \
+        -H "authorization: Bearer $XAI_API_KEY" 2>/dev/null \
+        | jq -r '.api_key_blocked' 2>/dev/null)
+    case $blocked in
+        false) printf 'key ok · proxy started per session' ;;
+        true)  printf 'key BLOCKED' ;;
+        *)     printf 'key unreachable' ;;
+    esac
 }
 EOF
 
     [[ -e $CL_HOME/litellm.yaml ]] || cat >"$CL_HOME/litellm.yaml" <<'EOF'
-# LiteLLM proxy config for claude-launcher's openai and grok providers.
+# REFERENCE ONLY. The launcher no longer uses this file at run time: for
+# openai and grok it generates a fresh per-session config from the active
+# provider's enabled models and starts a private proxy on an ephemeral
+# port (see managed_proxy in those .conf files). This file is kept as a
+# template for running a persistent proxy by hand if you prefer:
+#     litellm --config ~/.config/claude-launcher/litellm.yaml
 # Model names on the left are what the launcher passes via --model.
 # Requires OPENAI_API_KEY / XAI_API_KEY in the environment.
 #
@@ -502,6 +502,7 @@ normalize_ws() {
 name="" base_url="" auth_token_env="" auth_var="" default_haiku_model=""
 auth_optional=0 preflight_hint="" models_url="" models_auth_env="" auto_1m=0
 max_output_tokens="" efforts_map="" context_map=""
+managed_proxy=0 proxy_route="" proxy_key_env=""
 models=() extra_env=()
 
 load_provider() {
@@ -510,6 +511,7 @@ load_provider() {
     default_haiku_model="" auth_optional=0 preflight_hint=""
     models_url="" models_auth_env="" auto_1m=0 efforts="" models_filter=""
     max_output_tokens="" efforts_map="" context_map=""
+    managed_proxy=0 proxy_route="" proxy_key_env=""
     models=() extra_env=()
     unset -f provider_info 2>/dev/null
     [[ -r $PROVIDER_DIR/$id.conf ]] || die "no provider '$id' ($PROVIDER_DIR/$id.conf)"
@@ -959,6 +961,7 @@ update_info_line() {
 # --------------------------------------------------------------- launch
 
 LAUNCH_ENV=()
+LAUNCH_MODEL=""
 build_provider_env() {
     # $1 = model. Result in LAUNCH_ENV.
     LAUNCH_ENV=()
@@ -1021,10 +1024,190 @@ build_tune_env() {
 
 preflight() {
     [[ -n $base_url ]] || return 0
+    # A managed proxy is started by the launcher itself (start_managed_proxy),
+    # so there is nothing to reach yet at menu/launch time.
+    ((managed_proxy)) && return 0
     curl -s -o /dev/null --max-time 4 "$base_url" && return 0
     local msg="provider '$provider' endpoint unreachable: $base_url"
     [[ -n $preflight_hint ]] && msg+=$'\nclaude-launcher: '"$preflight_hint"
     die "$msg"
+}
+
+# ------------------------------------------------------- managed proxy
+#
+# For providers that need a LiteLLM proxy (managed_proxy=1), the launcher
+# starts a private proxy on an ephemeral port for the session and stops it
+# when the session exits. Facts pinned to LiteLLM (proxy_cli.py / health
+# endpoints), verified 2026-08-02:
+#   - flags: --host 127.0.0.1 --port N --config <yaml> (no short forms)
+#   - readiness: GET /health/readiness -> 200 once startup is done (no auth);
+#     /health/liveliness and /health are NOT the right probe
+#   - keyless: omit master_key + leave LITELLM_MASTER_KEY unset -> no auth
+#   - foreground process; background it and keep $! ; SIGTERM drains cleanly
+
+PROXY_PID=""
+PROXY_PORT=""
+PROXY_TMP=""
+PROXY_WATCHDOG_PID=""
+
+find_litellm() {
+    # Echo a command prefix that runs litellm, or empty if none is found.
+    # Order: a litellm already on PATH, then known isolated-install shims.
+    if command -v litellm >/dev/null 2>&1; then printf 'litellm'; return 0; fi
+    local p
+    for p in "$HOME/.local/bin/litellm" \
+             "$HOME/Library/Python"/*/bin/litellm \
+             /opt/homebrew/bin/litellm; do
+        [[ -x $p ]] && { printf '%s' "$p"; return 0; }
+    done
+    # uv-managed tool install exposes it via `uv tool run`.
+    if command -v uv >/dev/null 2>&1 && uv tool list 2>/dev/null | grep -q '^litellm'; then
+        printf 'uv tool run litellm'; return 0
+    fi
+    return 1
+}
+
+install_litellm() {
+    # Install litellm[proxy] with whatever isolated installer is available.
+    # Detection order favors isolation and avoids PEP 668 breakage on
+    # externally-managed system Pythons (Homebrew/Debian): uv, then pipx,
+    # then pip with --user, then a bare pip as last resort.
+    local cmd=""
+    if command -v uv >/dev/null 2>&1; then
+        cmd="uv tool install litellm[proxy]"
+    elif command -v pipx >/dev/null 2>&1; then
+        cmd="pipx install litellm[proxy]"
+    elif command -v pip3 >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
+        local pip; pip=$(command -v pip3 || command -v pip)
+        cmd="$pip install --user litellm[proxy]"
+    else
+        die "no Python installer found (need one of: uv, pipx, pip). Install LiteLLM manually: pip install 'litellm[proxy]'"
+    fi
+    printf 'claude-launcher: LiteLLM proxy not found; installing with: %s\n' "$cmd" >&2
+    # shellcheck disable=SC2086
+    if ! $cmd >&2; then
+        die "LiteLLM install failed ($cmd). Install manually: pip install 'litellm[proxy]'"
+    fi
+    find_litellm
+}
+
+free_port() {
+    # An OS-assigned free TCP port on the loopback (bind :0, read it back).
+    python3 - <<'PY' 2>/dev/null
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+write_proxy_config() {
+    # $1 = yaml path. One model_list entry per enabled model of the current
+    # provider, routed through proxy_route (openai/ or xai/). Keyless: no
+    # master_key. The vendor key env var is read by litellm at request time
+    # via os.environ, so it must be exported into the proxy's environment.
+    local out=$1 m route=$proxy_route keyenv=$proxy_key_env
+    {
+        printf '# generated per session by claude-launcher; do not edit\n'
+        printf 'model_list:\n'
+        for m in $(list_models suggested); do
+            printf '  - model_name: %s\n' "$m"
+            printf '    litellm_params:\n'
+            printf '      model: %s/%s\n' "$route" "$m"
+            printf '      api_key: os.environ/%s\n' "$keyenv"
+        done
+    } >"$out"
+}
+
+start_managed_proxy() {
+    # Starts the proxy, sets PROXY_PID/PORT/TMP and rewrites base_url to the
+    # chosen port. Returns non-zero (after cleanup) on any failure so the
+    # caller can abort the launch.
+    local litellm
+    litellm=$(find_litellm) || litellm=$(install_litellm) || return 1
+    [[ -n $litellm ]] || return 1
+
+    local keyenv=$proxy_key_env
+    if [[ -z ${!keyenv-} ]]; then
+        printf 'claude-launcher: provider %s needs $%s exported for the proxy\n' \
+            "$provider" "$keyenv" >&2
+        return 1
+    fi
+
+    PROXY_PORT=$(free_port)
+    [[ $PROXY_PORT =~ ^[0-9]+$ ]] || { printf 'claude-launcher: could not find a free port\n' >&2; return 1; }
+    PROXY_TMP=$(mktemp -d "${TMPDIR:-/tmp}/clh-proxy.XXXXXX") || return 1
+    write_proxy_config "$PROXY_TMP/config.yaml"
+
+    # Foreground process; background it, keep its PID. Keyless local bind.
+    # Suppress the feedback box; leave logs at the quiet default.
+    LITELLM_DONT_SHOW_FEEDBACK_BOX=true \
+        $litellm --config "$PROXY_TMP/config.yaml" \
+        --host 127.0.0.1 --port "$PROXY_PORT" \
+        >"$PROXY_TMP/proxy.log" 2>&1 &
+    PROXY_PID=$!
+
+    # Wait for readiness (GET /health/readiness -> 200), bounded.
+    local i
+    for ((i = 0; i < 60; i++)); do
+        if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+            printf 'claude-launcher: proxy exited during startup; last log lines:\n' >&2
+            tail -n 15 "$PROXY_TMP/proxy.log" >&2
+            return 1
+        fi
+        if curl -sf -m 2 -o /dev/null "http://127.0.0.1:$PROXY_PORT/health/readiness" 2>/dev/null; then
+            base_url="http://127.0.0.1:$PROXY_PORT"
+            start_proxy_watchdog
+            return 0
+        fi
+        sleep 0.5
+    done
+    printf 'claude-launcher: proxy did not become ready in 30s; last log lines:\n' >&2
+    tail -n 15 "$PROXY_TMP/proxy.log" >&2
+    stop_managed_proxy
+    return 1
+}
+
+start_proxy_watchdog() {
+    # Closes the one gap a bash trap cannot: if the launcher is SIGKILLed
+    # (kill -9, OOM, terminal slammed shut), no trap runs and the proxy
+    # would orphan. A detached watchdog polls the launcher PID and kills
+    # the proxy when the launcher is gone. Portable (no setsid/systemd, so
+    # it works on macOS too). Normal exits still go through the trap, which
+    # also stops this watchdog.
+    local launcher_pid=$$ proxy_pid=$PROXY_PID
+    (
+        while kill -0 "$launcher_pid" 2>/dev/null; do sleep 2; done
+        kill -TERM "$proxy_pid" 2>/dev/null
+    ) >/dev/null 2>&1 &
+    PROXY_WATCHDOG_PID=$!
+    # Don't let the script wait on the watchdog at exit.
+    disown "$PROXY_WATCHDOG_PID" 2>/dev/null || true
+}
+
+stop_managed_proxy() {
+    # SIGTERM (drains), wait briefly, SIGKILL as fallback. Idempotent, and
+    # safe to call from a signal trap (each step tolerates already-dead
+    # pids). Also retires the watchdog.
+    if [[ -n $PROXY_WATCHDOG_PID ]]; then
+        kill -TERM "$PROXY_WATCHDOG_PID" 2>/dev/null
+        PROXY_WATCHDOG_PID=""
+    fi
+    [[ -n $PROXY_PID ]] || return 0
+    if kill -0 "$PROXY_PID" 2>/dev/null; then
+        kill -TERM "$PROXY_PID" 2>/dev/null
+        local i
+        for ((i = 0; i < 20; i++)); do
+            kill -0 "$PROXY_PID" 2>/dev/null || break
+            sleep 0.25
+        done
+        kill -0 "$PROXY_PID" 2>/dev/null && kill -KILL "$PROXY_PID" 2>/dev/null
+    fi
+    wait "$PROXY_PID" 2>/dev/null
+    PROXY_PID=""
+    [[ -n $PROXY_TMP && -d $PROXY_TMP ]] && rm -rf "$PROXY_TMP"
+    PROXY_TMP=""
 }
 
 run_claude() {
@@ -1033,6 +1216,7 @@ run_claude() {
     mapfile -t skip_env < <(hook_skip_env)
     if [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]]; then
         local out="env" e a
+        ((managed_proxy)) && out="[managed proxy: $proxy_route on an ephemeral port] $out"
         [[ -n $base_url ]] && out+=" -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN"
         if [[ -n $base_url ]]; then
             for e in "${LAUNCH_ENV[@]}"; do out+=" $(printf '%q' "$e")"; done
@@ -1043,6 +1227,25 @@ run_claude() {
         printf '%s\n' "$out"
         exit 0
     fi
+
+    # Managed proxy: the launcher must OUTLIVE claude to tear the proxy
+    # down, so it cannot exec. Start the proxy (which sets base_url to the
+    # ephemeral port and must happen BEFORE build_provider_env's base_url
+    # was captured -- so LAUNCH_ENV is rebuilt here), run claude as a child
+    # under a cleanup trap, and propagate its exit code.
+    if ((managed_proxy)); then
+        trap stop_managed_proxy EXIT INT TERM
+        start_managed_proxy || die "could not start the LiteLLM proxy for '$provider'"
+        # base_url now points at the live proxy port; rebuild provider env.
+        build_provider_env "$LAUNCH_MODEL"
+        local rc=0
+        env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+            "${LAUNCH_ENV[@]}" "${TUNE_ENV[@]}" "${skip_env[@]}" "$CLAUDE_BIN" "$@" || rc=$?
+        stop_managed_proxy
+        trap - EXIT INT TERM
+        exit "$rc"
+    fi
+
     preflight
     if [[ -n $base_url ]]; then
         # Third-party endpoint: never leak the Anthropic credentials
@@ -1096,6 +1299,7 @@ launch_session() {
     fi
     [[ -n $session_flag ]] && args+=("$session_flag")
 
+    LAUNCH_MODEL=$model
     build_provider_env "$model"
     build_tune_env "$model"
     run_claude "${args[@]}"
@@ -1133,6 +1337,7 @@ passthrough() {
         args+=(--effort "$effort")
     fi
     args+=("$@")
+    LAUNCH_MODEL=$model
     build_provider_env "$model"
     build_tune_env "$model"
     run_claude "${args[@]}"

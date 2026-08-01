@@ -102,21 +102,25 @@ The main screen lists every configured provider on one line, the current one bra
 |---|---|---|
 | **anthropic** | Native API, your normal Claude Code login, no env changes | (login) |
 | **moonshot** | Kimi over the [documented Anthropic-compatible endpoint](https://platform.kimi.ai/docs/guide/claude-code-kimi) `https://api.moonshot.ai/anthropic` | `KIMI_API_KEY` |
-| **openai** | Through a local [LiteLLM](https://docs.litellm.ai) proxy (OpenAI serves no Anthropic-compatible endpoint) | `OPENAI_API_KEY` |
-| **grok** | Through the same LiteLLM proxy (xAI serves no Anthropic-compatible endpoint) | `XAI_API_KEY` |
+| **openai** | Through a per-session [LiteLLM](https://docs.litellm.ai) proxy the launcher starts and stops for you (OpenAI serves no Anthropic-compatible endpoint) | `OPENAI_API_KEY` |
+| **grok** | Through the same per-session LiteLLM proxy (xAI serves no Anthropic-compatible endpoint) | `XAI_API_KEY` |
 
 For any third-party provider the launcher exports `ANTHROPIC_BASE_URL`, the auth token, `ANTHROPIC_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` (so background and haiku-class calls stay on that provider), and **strips `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` from the environment** so your Anthropic credential is never sent to another host.
 
-`openai` and `grok` are deliberately separate menu entries rather than a single "litellm" one, so you pick the end vendor and model, not the plumbing. Each carries its own model list, its own vendor key check, and a `models_filter` regex so proxy-wide model discovery sorts new IDs to the right vendor.
+`openai` and `grok` are deliberately separate menu entries rather than a single "litellm" one, so you pick the end vendor and model, not the plumbing. Each carries its own model list, its own vendor key check, and a `models_filter` regex so vendor model discovery sorts new IDs to the right provider.
 
-### LiteLLM proxy (for OpenAI / Grok only)
+### Dynamic per-session proxy (OpenAI / Grok)
 
-```sh
-pip install 'litellm[proxy]'
-litellm --config ~/.config/claude-launcher/litellm.yaml   # needs OPENAI_API_KEY / XAI_API_KEY
-```
+These two providers need a LiteLLM proxy because neither vendor serves an Anthropic-compatible endpoint. You do **not** run it yourself. When you launch an `openai` or `grok` session, the launcher:
 
-The launcher checks the proxy is reachable before launching and prints the start command if it is not. Anthropic and Moonshot need no proxy.
+1. finds `litellm`, or installs `litellm[proxy]` on first use (auto-detecting the best available installer: `uv`, then `pipx`, then `pip --user`; prompts before installing);
+2. starts a private proxy on an **ephemeral port** with a config generated from that provider's enabled models, running keyless and bound to `127.0.0.1`;
+3. waits for the proxy's `/health/readiness` to report ready, then points `ANTHROPIC_BASE_URL` at that port;
+4. runs Claude Code as a child, and **stops the proxy when the session exits** (`SIGTERM`, draining in-flight requests).
+
+Because the port is ephemeral, multiple concurrent sessions never collide. If the launcher is force-killed (`kill -9`, OOM, terminal closed), a small detached watchdog notices the launcher is gone and reaps the proxy, so it does not orphan. Anthropic and Moonshot use no proxy and are unaffected.
+
+Only `OPENAI_API_KEY` (for openai) or `XAI_API_KEY` (for grok) needs to be exported; the proxy reads it at request time. Model discovery and the account line query the vendor's API directly, since the proxy only exists during a live session.
 
 ### Adding a provider
 
@@ -134,7 +138,7 @@ Copy `~/.config/claude-launcher/providers/custom.conf.example` to `<id>.conf`. A
 
 Cycling the effort row in the menu moves through the supported set only.
 
-> **OpenAI / Grok caveat.** Effort only reaches these models if your LiteLLM proxy forwards Claude Code's `output_config.effort` to the vendor's `reasoning_effort`. Current LiteLLM does this; some pinned or older releases silently drop it and default every request to `medium`. The menu is correct either way; this only governs whether the chosen level actually lands. See the header comment in `litellm.yaml`.
+> **OpenAI / Grok caveat.** Effort only reaches these models if the LiteLLM proxy forwards Claude Code's `output_config.effort` to the vendor's `reasoning_effort`. Current LiteLLM does this; some pinned or older releases silently drop it and default every request to `medium`. The menu is correct either way; this only governs whether the chosen level actually lands. If effort seems stuck, upgrade LiteLLM (`uv tool upgrade litellm` or `pipx upgrade litellm`).
 
 ---
 
@@ -204,7 +208,7 @@ On menu start (at most once per 24h) and on demand with `[u]`, the launcher fetc
 ~/.config/claude-launcher/state             remembered choices
 ~/.config/claude-launcher/providers/*.conf  provider definitions
 ~/.config/claude-launcher/cache/            model-discovery baselines, cached account data
-~/.config/claude-launcher/litellm.yaml      proxy config for OpenAI/Grok
+~/.config/claude-launcher/litellm.yaml      reference proxy config (per-session config is generated automatically)
 ~/.config/claude-launcher/statusline.sh     seeded status line
 ```
 
