@@ -102,6 +102,7 @@ The main screen lists every configured provider on one line, the current one bra
 |---|---|---|
 | **anthropic** | Native API, your normal Claude Code login, no env changes | (login) |
 | **moonshot** | Kimi over the [documented Anthropic-compatible endpoint](https://platform.kimi.ai/docs/guide/claude-code-kimi) `https://api.moonshot.ai/anthropic` | `KIMI_API_KEY` |
+| **deepseek** | DeepSeek over its native Anthropic-compatible endpoint `https://api.deepseek.com/anthropic` (no proxy) | `DEEPSEEK_API_KEY` |
 | **openai** | Through a per-session [LiteLLM](https://docs.litellm.ai) proxy the launcher starts and stops for you (OpenAI serves no Anthropic-compatible endpoint) | `OPENAI_API_KEY` |
 | **grok** | Through the same per-session LiteLLM proxy (xAI serves no Anthropic-compatible endpoint) | `XAI_API_KEY` |
 

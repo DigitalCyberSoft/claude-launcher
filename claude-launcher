@@ -301,6 +301,54 @@ provider_info() {
 }
 EOF
 
+    [[ -e $PROVIDER_DIR/deepseek.conf ]] || cat >"$PROVIDER_DIR/deepseek.conf" <<'EOF'
+# DeepSeek over its native Anthropic-compatible endpoint (no proxy needed,
+# like Moonshot). Source: api-docs.deepseek.com/guides/anthropic_api and
+# the model table at api-docs.deepseek.com/quick_start/pricing.
+# Uses the DEEPSEEK_API_KEY exported in ~/.bashrc.
+name="DeepSeek"
+base_url="https://api.deepseek.com/anthropic"
+auth_token_env="DEEPSEEK_API_KEY"
+# DeepSeek authenticates the Anthropic endpoint with a Bearer token
+# (verified 2026-08-02), which is the ANTHROPIC_AUTH_TOKEN default.
+auth_var="ANTHROPIC_AUTH_TOKEN"
+# Background/haiku-class calls must not fall back to Anthropic model names.
+default_haiku_model="deepseek-v4-flash"
+# Both models are 1M context (official table 2026-08-02), so append [1m].
+auto_1m=1
+# /models carries no context metadata (id/object/owned_by only, checked
+# 2026-08-02); declare per model. Both are 1M.
+context_map="
+deepseek-v4-flash 1000000
+deepseek-v4-pro 1000000
+"
+# MAX OUTPUT 384K for both (official table); well above CC's 128K default.
+max_output_tokens=384000
+# The Anthropic endpoint ACCEPTS output_config.effort at low/medium/high/
+# max (probed 2026-08-02), but DeepSeek documents thinking as an on/off
+# mode, not a graded scale, and low-vs-max barely changed output depth in
+# testing (574 vs 625 tokens on the same prompt). Levels are wired because
+# they are accepted and harmless; they may not actually grade reasoning.
+efforts="low medium high max"
+# /models is OpenAI-shape (.data[].id); discovery works with the default
+# header set (verified 2026-08-02).
+models_url="https://api.deepseek.com/models"
+models=(
+    "deepseek-v4-pro"
+    "deepseek-v4-flash"
+)
+# Account balance (documented endpoint, verified 2026-08-02).
+provider_info() {
+    local key="${!auth_token_env-}"
+    [[ -n $key ]] || return 0
+    curl -sf --max-time 6 https://api.deepseek.com/user/balance \
+        -H "authorization: Bearer $key" 2>/dev/null \
+        | jq -r 'if .is_available then
+            (.balance_infos[0] | "balance \(.currency) \(.total_balance)")
+            else "balance unavailable" end' 2>/dev/null
+}
+EOF
+
     [[ -e $CL_HOME/litellm.yaml ]] || cat >"$CL_HOME/litellm.yaml" <<'EOF'
 # REFERENCE ONLY. The launcher no longer uses this file at run time: for
 # openai and grok it generates a fresh per-session config from the active
@@ -346,10 +394,8 @@ EOF
 
     [[ -e $PROVIDER_DIR/custom.conf.example ]] || cat >"$PROVIDER_DIR/custom.conf.example" <<'EOF'
 # Copy to <id>.conf to add a provider with an Anthropic-compatible API.
-# Documented native options as of 2026-08:
-#   DeepSeek: base_url="https://api.deepseek.com/anthropic"
-#             auth_var="ANTHROPIC_API_KEY"   (DeepSeek wants X-Api-Key)
-#             (api-docs.deepseek.com/guides/anthropic_api)
+# DeepSeek ships as its own provider (deepseek.conf). More native options
+# as of 2026-08:
 #   Z.ai:     base_url="https://api.z.ai/api/anthropic"  glm-5.2[1m]
 #   MiniMax:  base_url="https://api.minimax.io/anthropic" MiniMax-M3[1m]
 name="Example"
