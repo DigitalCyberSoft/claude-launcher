@@ -3,10 +3,11 @@
 #
 # Bare `claude` (aliased to this script) shows a menu: session type
 # (fresh / continue / resume), provider, model, effort, and per-run
-# toggles (hooks / DTM system prompt / safe mode). New models are
-# detected against the provider's models endpoint at most once per day
-# and added to the suggestions; individual models can be disabled so
-# they are no longer suggested.
+# toggles (hooks / system prompt / no-CLAUDE.md / safe mode). The system
+# prompt row cycles through every prompt discovered under
+# system_prompt_dir. New models are detected against the provider's
+# models endpoint at most once per day and added to the suggestions;
+# individual models can be disabled so they are no longer suggested.
 #
 # Any invocation WITH arguments passes straight through to the real
 # claude binary with the remembered provider, model, and effort applied
@@ -69,8 +70,13 @@ seed_files() {
 # Path to the real claude binary. Empty = first `claude` in PATH.
 claude_bin=""
 
-# File used by the "dtm prompt" toggle.
-system_prompt_file="$HOME/.claude/system-prompts/dtm/dtm.md"
+# System prompts. The "prompt" menu row cycles through "off" plus every
+# prompt discovered under system_prompt_dir, so you can switch between
+# custom system prompts per launch. Discovery: an entry file
+# <dir>/<name>/<name>.md (a folder whose main .md matches the folder
+# name), or a bare <dir>/<name>.md. The menu shows <name>; "off" sends no
+# system-prompt flag.
+system_prompt_dir="$HOME/.claude/system-prompts"
 
 # replace = --system-prompt-file (replaces Claude Code's default system
 #           prompt; matches the old commented alias in ~/.bashrc)
@@ -505,7 +511,7 @@ EOF
 # ---------------------------------------------------------- config/state
 
 claude_bin=""
-system_prompt_file=""
+system_prompt_dir="$HOME/.claude/system-prompts"
 system_prompt_mode="replace"
 
 load_config() {
@@ -522,6 +528,21 @@ load_state() {
         [[ -z $k || $k == \#* ]] && continue
         STATE[$k]=$v
     done <"$STATE_FILE"
+    migrate_state
+}
+
+migrate_state() {
+    # One-time: the old boolean "dtm" toggle became the "prompt" cycle.
+    # A user who had dtm=on kept the single hardcoded dtm prompt; carry
+    # that over to prompt=dtm (only if a "dtm" prompt actually exists and
+    # no prompt is set yet), then drop the dead key.
+    if [[ -n ${STATE[dtm]-} ]]; then
+        if [[ -z ${STATE[prompt]-} && ${STATE[dtm]} == on && -n $(prompt_file dtm) ]]; then
+            STATE[prompt]=dtm
+        fi
+        unset 'STATE[dtm]'
+        save_state
+    fi
 }
 
 state_get() { printf '%s' "${STATE[$1]-$2}"; }
@@ -717,6 +738,52 @@ resolve_effort() {
         [[ $o == "$want" ]] && { printf '%s' "$want"; return 0; }
     done
     printf '%s' "${opts[-1]}"   # highest supported
+}
+
+# ---------------------------------------------------- system prompts
+
+prompt_names() {
+    # Discovered system-prompt names, one per line, sorted. A name comes
+    # from either <dir>/<name>/<name>.md (folder whose entry .md matches
+    # the folder) or a bare <dir>/<name>.md. Nothing printed when the
+    # directory is absent or empty.
+    local d=$system_prompt_dir f base
+    [[ -d $d ]] || return 0
+    {
+        for f in "$d"/*/; do
+            [[ -d $f ]] || continue
+            base=$(basename "$f")
+            [[ -r $d/$base/$base.md ]] && printf '%s\n' "$base"
+        done
+        for f in "$d"/*.md; do
+            [[ -r $f ]] || continue
+            base=$(basename "$f" .md)
+            printf '%s\n' "$base"
+        done
+    } | sort -u
+}
+
+prompt_file() {
+    # Absolute path to the entry .md for prompt name $1, or empty.
+    local name=$1 d=$system_prompt_dir
+    [[ -n $name && $name != off ]] || return 0
+    if [[ -r $d/$name/$name.md ]]; then printf '%s' "$d/$name/$name.md"
+    elif [[ -r $d/$name.md ]]; then printf '%s' "$d/$name.md"
+    fi
+}
+
+prompt_options() {
+    # "off" followed by every discovered prompt; the menu cycles these.
+    printf 'off\n'
+    prompt_names
+}
+
+current_prompt() {
+    # Remembered prompt name, defaulting to off, but never a name that no
+    # longer exists on disk (a deleted prompt falls back to off).
+    local want; want=$(state_get prompt off)
+    [[ $want == off ]] && { printf 'off'; return 0; }
+    [[ -n $(prompt_file "$want") ]] && printf '%s' "$want" || printf 'off'
 }
 
 refresh_models() {
@@ -1049,9 +1116,16 @@ build_tune_env() {
     #     cache there is pure downside. Third-party ids have no registry
     #     entry and fall back to ber=200000, which is why kimi-k3 (1M)
     #     was compacting at 200K.
+    #   CLAUDE_CODE_DISABLE_CLAUDE_MDS - when the "no CLAUDE.md" toggle is
+    #     on. Skips CLAUDE.md auto-discovery (project AND global
+    #     ~/.claude/CLAUDE.md) for this launch only, without safe mode's
+    #     collateral (hooks/plugins/skills/MCP stay on). Wire-sentinel
+    #     verified on 2.1.220.
     TUNE_ENV=("CLAUDE_LAUNCHER_PROVIDER=$provider" "CLAUDE_LAUNCHER_HOME=$CL_HOME")
     [[ -n $max_output_tokens ]] \
         && TUNE_ENV+=("CLAUDE_CODE_MAX_OUTPUT_TOKENS=$max_output_tokens")
+    [[ $(state_get nomd off) == on ]] \
+        && TUNE_ENV+=("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1")
     if [[ -n $base_url ]]; then
         local ctx acw
         ctx=$(model_context "$1")
@@ -1335,11 +1409,14 @@ launch_session() {
     fi
     [[ -n $settings ]] && args+=(--settings "$settings")
     [[ $(state_get safe off) == on ]] && args+=(--safe-mode)
-    if [[ $(state_get dtm off) == on ]]; then
-        [[ -r $system_prompt_file ]] || die "dtm prompt enabled but $system_prompt_file is unreadable"
+    local prompt pfile
+    prompt=$(current_prompt)
+    if [[ $prompt != off ]]; then
+        pfile=$(prompt_file "$prompt")
+        [[ -n $pfile ]] || die "system prompt '$prompt' not found under $system_prompt_dir"
         case $system_prompt_mode in
-            replace) args+=(--system-prompt-file "$system_prompt_file") ;;
-            append)  args+=(--append-system-prompt-file "$system_prompt_file") ;;
+            replace) args+=(--system-prompt-file "$pfile") ;;
+            append)  args+=(--append-system-prompt-file "$pfile") ;;
             *) die "system_prompt_mode must be replace or append (got '$system_prompt_mode')" ;;
         esac
     fi
@@ -1514,7 +1591,8 @@ render() {
     printf '  model       %-32s [m]\n' "$mval"
     printf '  effort      %-32s [e]\n' "$(resolve_effort)"
     printf '  hooks       %-32s [h]\n' "$(state_get hooks on)${HOOKS_INFO:+ ($HOOKS_INFO)}"
-    printf '  dtm prompt  %-32s [s]\n' "$(state_get dtm off)"
+    printf '  sys prompt  %-32s [s]\n' "$(tui_row_value prompt)"
+    printf '  no CLAUDE.md %-31s [n]\n' "$(state_get nomd off)"
     printf '  safe mode   %-32s [v]  (CLAUDE.md, hooks, plugins, skills all off)\n' "$(state_get safe off)"
     printf '\n  [enter/f] fresh   [c] continue   [r] resume picker\n'
     printf '  [u] refresh models   [q] quit\n'
@@ -1551,7 +1629,8 @@ menu_plain() {
             e)      cycle_effort_dir 1 ;;
             u)      refresh_models manual; update_info_line force ;;
             h)      toggle hooks on ;;
-            s)      toggle dtm off ;;
+            s)      cycle_prompt_dir 1 ;;
+            n)      toggle nomd off ;;
             v)      toggle safe off ;;
             q)      exit 0 ;;
         esac
@@ -1659,7 +1738,8 @@ tui_row_label() {
         model)    printf 'Model' ;;
         effort)   printf 'Effort' ;;
         hooks)    printf 'Hooks' ;;
-        dtm)      printf 'DTM prompt' ;;
+        prompt)   printf 'System prompt' ;;
+        nomd)     printf 'No CLAUDE.md' ;;
         safe)     printf 'Safe mode' ;;
         refresh)  printf 'Refresh models now' ;;
         quit)     printf 'Quit' ;;
@@ -1668,7 +1748,7 @@ tui_row_label() {
 
 tui_row_adjustable() {
     case $1 in
-        provider | model | effort | hooks | dtm | safe) return 0 ;;
+        provider | model | effort | hooks | prompt | nomd | safe) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1703,7 +1783,16 @@ tui_row_value() {
                 printf '%s%s' "$v" "${HOOKS_INFO:+ · $HOOKS_INFO}"
             fi
             ;;
-        dtm)      state_get dtm off ;;
+        prompt)
+            v=$(current_prompt)
+            if [[ $v == off ]]; then
+                local np; np=$(prompt_names | wc -l)
+                printf 'off%s' "$( ((np)) && printf ' · %s available' "$np")"
+            else
+                printf '%s (%s)' "$v" "$system_prompt_mode"
+            fi
+            ;;
+        nomd)     state_get nomd off ;;
         safe)     state_get safe off ;;
     esac
 }
@@ -1764,6 +1853,19 @@ cycle_effort_dir() {
     state_set effort "${opts[$(((i + n + dir) % n))]}"
 }
 
+cycle_prompt_dir() {
+    local dir=$1 cur i n opts=() j
+    mapfile -t opts < <(prompt_options)
+    n=${#opts[@]}
+    ((n)) || return 0
+    cur=$(current_prompt)
+    i=0
+    for j in "${!opts[@]}"; do
+        [[ ${opts[$j]} == "$cur" ]] && { i=$j; break; }
+    done
+    state_set prompt "${opts[$(((i + n + dir) % n))]}"
+}
+
 cycle_provider() {
     local dir=$1 ids=() i j cand n
     mapfile -t ids < <(provider_ids)
@@ -1804,7 +1906,8 @@ tui_adjust() {
         model)          cycle_model "$2" ;;
         effort)         cycle_effort_dir "$2" ;;
         hooks)          toggle hooks on ;;
-        dtm)            toggle dtm off ;;
+        prompt)         cycle_prompt_dir "$2" ;;
+        nomd)           toggle nomd off ;;
         safe)           toggle safe off ;;
         fresh | continue | resume | resume[123] | refresh | quit)
             [[ $2 == 1 ]] && tui_enter "$1" ;;
@@ -1942,11 +2045,32 @@ tui_enter() {
         model)    tui_pick_model ;;
         effort)   cycle_effort_dir 1 ;;
         hooks)    tui_pick_hooks ;;
-        dtm)      toggle dtm off ;;
+        prompt)   tui_pick_prompt ;;
+        nomd)     toggle nomd off ;;
         safe)     toggle safe off ;;
         refresh)  TUI_MSG=$(refresh_models manual); update_info_line force ;;
         quit)     tui_teardown; exit 0 ;;
     esac
+}
+
+tui_pick_prompt() {
+    # Pick the system prompt: "off" plus every discovered prompt. Enter
+    # selects. With no prompts on disk, cycling still shows just "off".
+    local -a opts=() items=()
+    mapfile -t opts < <(prompt_options)
+    ((${#opts[@]} > 1)) || { TUI_MSG="no system prompts under $system_prompt_dir"; return 0; }
+    local cur o sel=0
+    cur=$(current_prompt)
+    for o in "${!opts[@]}"; do
+        [[ ${opts[$o]} == "$cur" ]] && sel=$o
+        if [[ ${opts[$o]} == off ]]; then
+            items+=("off  ${C_DIM}(Claude Code default prompt)${C_RESET}")
+        else
+            items+=("${opts[$o]}")
+        fi
+    done
+    tui_select "system prompt · ${system_prompt_mode}s the default" "" "$sel" "${items[@]}" || return 0
+    state_set prompt "${opts[$TUI_CHOICE]}"
 }
 
 tui_pick_hooks() {
@@ -2001,7 +2125,7 @@ menu_tui() {
         [[ -n ${SESS_IDS[$k]-} ]] && TUI_ROWS+=("resume$k")
     done
     ((RESUME_COUNT > 4)) && TUI_ROWS+=(resume)
-    TUI_ROWS+=(provider model effort hooks dtm safe refresh quit)
+    TUI_ROWS+=(provider model effort hooks prompt nomd safe refresh quit)
     n=${#TUI_ROWS[@]}
     init_colors
     tui_setup
@@ -2025,7 +2149,8 @@ menu_tui() {
             e)           cycle_effort_dir 1 ;;
             u)           TUI_MSG=$(refresh_models manual); update_info_line force ;;
             h)           toggle hooks on ;;
-            s)           toggle dtm off ;;
+            s)           tui_pick_prompt ;;
+            n)           toggle nomd off ;;
             v)           toggle safe off ;;
             q)           tui_teardown; exit 0 ;;
         esac

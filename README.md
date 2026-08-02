@@ -78,11 +78,11 @@ Over a pipe or a dumb terminal it falls back to a plain line menu with the same 
 [enter/f] fresh   [c] continue   [r] resume picker
 [p] provider   [m] model (o = free text, x = enable/disable)
 [e] effort   [u] refresh models
-[h] hooks    [s] system prompt   [v] safe mode
+[h] hooks    [s] system prompt   [n] no CLAUDE.md   [v] safe mode
 [q] quit
 ```
 
-Your provider, model, effort, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, hooks on, system prompt off, safe mode off.
+Your provider, model, effort, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
 
 ### Sessions
 
@@ -179,8 +179,9 @@ It is injected via `--settings` for third-party providers only, so on Anthropic 
 
 ## Other toggles
 
-- **system prompt** (`[s]`): loads a system-prompt file via `--system-prompt-file` (replace) or `--append-system-prompt-file` (append), selected by `system_prompt_mode` in the config. Point `system_prompt_file` in `~/.config/claude-launcher/config` at any Markdown file.
-- **safe mode** (`[v]`): passes `--safe-mode`, Claude Code's supported way to run without your `CLAUDE.md` (it also disables skills, plugins, hooks, and MCP servers). There is no narrower per-`CLAUDE.md` switch in Claude Code.
+- **system prompt** (`[s]`): cycles through `off` plus every system prompt discovered under `system_prompt_dir` (default `~/.claude/system-prompts`), so you can switch prompts per launch; `enter` opens a picker. A prompt is either a folder whose main file matches its name (`<dir>/<name>/<name>.md`) or a bare `<dir>/<name>.md`; the menu shows `<name>`. The selected prompt is applied with `--system-prompt-file` (replace) or `--append-system-prompt-file` (append), chosen by `system_prompt_mode` in the config. `off` sends no flag (Claude Code's default prompt). Drop a new `.md` in the directory and it appears in the menu; no config edit needed.
+- **no CLAUDE.md** (`[n]`): sets `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` for that launch, which skips `CLAUDE.md` auto-discovery — both project files and the global `~/.claude/CLAUDE.md` — while leaving hooks, plugins, skills, and MCP servers on. This is the surgical way to run without your `CLAUDE.md`; unlike safe mode it disables nothing else. (Verified by request-capture on Claude Code 2.1.220.)
+- **safe mode** (`[v]`): passes `--safe-mode`, which runs without `CLAUDE.md` **and** also disables skills, plugins, hooks, and MCP servers. Use `no CLAUDE.md` instead if you only want to drop the `CLAUDE.md` context.
 
 Menu toggles are **not** applied on the pass-through path (`claude <args>`); that path mirrors the plain alias and only injects the remembered model and effort.
 
