@@ -77,12 +77,12 @@ Over a pipe or a dumb terminal it falls back to a plain line menu with the same 
 ```
 [enter/f] fresh   [c] continue   [r] resume picker
 [p] provider   [m] model (o = free text, x = enable/disable)
-[e] effort   [u] refresh models
+[e] effort   [a] subagent model   [u] refresh models
 [h] hooks    [s] system prompt   [n] no CLAUDE.md   [v] safe mode
 [q] quit
 ```
 
-Your provider, model, effort, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
+Your provider, model, effort, subagent model, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, subagent `inherit`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
 
 ### Sessions
 
@@ -183,7 +183,24 @@ It is injected via `--settings` for third-party providers only, so on Anthropic 
 - **no CLAUDE.md** (`[n]`): sets `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` for that launch, which skips `CLAUDE.md` auto-discovery — both project files and the global `~/.claude/CLAUDE.md` — while leaving hooks, plugins, skills, and MCP servers on. This is the surgical way to run without your `CLAUDE.md`; unlike safe mode it disables nothing else. (Verified by request-capture on Claude Code 2.1.220.)
 - **safe mode** (`[v]`): passes `--safe-mode`, which runs without `CLAUDE.md` **and** also disables skills, plugins, hooks, and MCP servers. Use `no CLAUDE.md` instead if you only want to drop the `CLAUDE.md` context.
 
-Menu toggles are **not** applied on the pass-through path (`claude <args>`); that path mirrors the plain alias and only injects the remembered model and effort.
+## Subagent model
+
+The **subagent** row (`[a]`) chooses the model that `Task`/subagent runs use, independently of your main model, by exporting `CLAUDE_CODE_SUBAGENT_MODEL` (which Claude Code treats as an override of a subagent's own/frontmatter model). It cycles `inherit` (each subagent keeps its own model) plus every enabled model of the current provider, remembered per provider. So you can run, say, a strong main model that dispatches a cheaper, faster model for subagents — e.g. DeepSeek V4 Pro as the driver launching V4 Flash for agents.
+
+## Naming provider models in Claude Code's `/model` menu
+
+Claude Code's own `/model` menu (opened inside a session) is built from a fixed set of tiers, not an arbitrary model list. A provider conf can map its models onto those tiers with `tier_map`, so they appear in `/model` — each with a real name instead of `Custom Haiku model`:
+
+```
+tier_map="
+opus  deepseek-v4-pro   | DeepSeek V4 Pro   | DeepSeek V4 Pro · 1M context
+haiku deepseek-v4-flash | DeepSeek V4 Flash | DeepSeek V4 Flash · fast, cheap
+"
+```
+
+Each line is `<tier> <model-id> | <menu label> | <description>` (label and description optional). Tiers are `opus`, `sonnet`, `haiku`, `fable` — so up to four models plus the main model can show, each named. The launcher exports the `ANTHROPIC_DEFAULT_<TIER>_MODEL` / `_MODEL_NAME` / `_MODEL_DESCRIPTION` variables that Claude Code reads to build those rows. The `haiku` tier doubles as the background/haiku-class model.
+
+Model, effort, subagent, tier, and toggle settings all apply on the menu launch paths. The pass-through path (`claude <args>`) mirrors the plain alias for the session flags (model + effort) but still sets the provider environment, including the tier and subagent variables.
 
 ---
 

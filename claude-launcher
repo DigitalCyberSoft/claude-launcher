@@ -318,8 +318,15 @@ auth_token_env="DEEPSEEK_API_KEY"
 # DeepSeek authenticates the Anthropic endpoint with a Bearer token
 # (verified 2026-08-02), which is the ANTHROPIC_AUTH_TOKEN default.
 auth_var="ANTHROPIC_AUTH_TOKEN"
-# Background/haiku-class calls must not fall back to Anthropic model names.
-default_haiku_model="deepseek-v4-flash"
+# Map both models onto Claude Code's /model tiers so they BOTH show in the
+# native /model menu, each named properly (not "deepseek-v4-flash / Custom
+# Haiku model"). Format: <tier> <id> | <menu label> | <description>.
+# haiku also serves as the background/haiku-class model, so this replaces
+# default_haiku_model. Tiers cap at opus/sonnet/haiku/fable.
+tier_map="
+opus deepseek-v4-pro | DeepSeek V4 Pro | DeepSeek V4 Pro · 1M context, strongest
+haiku deepseek-v4-flash | DeepSeek V4 Flash | DeepSeek V4 Flash · fast, cheap
+"
 # Both models are 1M context (official table 2026-08-02), so append [1m].
 auto_1m=1
 # /models carries no context metadata (id/object/owned_by only, checked
@@ -568,7 +575,7 @@ normalize_ws() {
 
 name="" base_url="" auth_token_env="" auth_var="" default_haiku_model=""
 auth_optional=0 preflight_hint="" models_url="" models_auth_env="" auto_1m=0
-max_output_tokens="" efforts_map="" context_map=""
+max_output_tokens="" efforts_map="" context_map="" tier_map=""
 managed_proxy=0 proxy_route="" proxy_key_env=""
 models=() extra_env=()
 
@@ -577,7 +584,7 @@ load_provider() {
     name="" base_url="" auth_token_env="" auth_var="ANTHROPIC_AUTH_TOKEN"
     default_haiku_model="" auth_optional=0 preflight_hint=""
     models_url="" models_auth_env="" auto_1m=0 efforts="" models_filter=""
-    max_output_tokens="" efforts_map="" context_map=""
+    max_output_tokens="" efforts_map="" context_map="" tier_map=""
     managed_proxy=0 proxy_route="" proxy_key_env=""
     models=() extra_env=()
     unset -f provider_info 2>/dev/null
@@ -784,6 +791,27 @@ current_prompt() {
     local want; want=$(state_get prompt off)
     [[ $want == off ]] && { printf 'off'; return 0; }
     [[ -n $(prompt_file "$want") ]] && printf '%s' "$want" || printf 'off'
+}
+
+# ---------------------------------------------------- subagent model
+
+subagent_options() {
+    # "inherit" (subagents use their own/frontmatter model) plus each
+    # enabled model of the current provider. Only offered when the provider
+    # has more than one model to choose between.
+    printf 'inherit\n'
+    list_models suggested
+}
+
+current_subagent() {
+    # Remembered subagent model, defaulting to inherit; falls back to
+    # inherit if the saved model is no longer an enabled suggestion.
+    local want m; want=$(state_get "subagent__$provider" inherit)
+    [[ $want == inherit ]] && { printf 'inherit'; return 0; }
+    while IFS= read -r m; do
+        [[ $m == "$want" ]] && { printf '%s' "$want"; return 0; }
+    done < <(list_models suggested)
+    printf 'inherit'
 }
 
 refresh_models() {
@@ -1092,8 +1120,54 @@ build_provider_env() {
     LAUNCH_ENV=("ANTHROPIC_BASE_URL=$base_url" "ANTHROPIC_MODEL=$1")
     [[ -n $tok ]] && LAUNCH_ENV+=("$auth_var=$tok")
     [[ -n $default_haiku_model ]] && LAUNCH_ENV+=("ANTHROPIC_DEFAULT_HAIKU_MODEL=$default_haiku_model")
+    add_tier_env
+    add_subagent_env
     ((${#extra_env[@]})) && LAUNCH_ENV+=("${extra_env[@]}")
     return 0
+}
+
+add_tier_env() {
+    # Map this provider's models onto Claude Code's /model tiers so they
+    # appear in the native /model menu, each properly named. Claude Code
+    # 2.1.220 builds a tier row only when ANTHROPIC_DEFAULT_<TIER>_MODEL is
+    # set (decompiled FBc/jBc), reading _MODEL (id), _MODEL_NAME (menu
+    # label), and _MODEL_DESCRIPTION (grey text). tier_map lines:
+    #     <tier> <model-id> [| Display Name | description]
+    # tier in opus|sonnet|haiku|fable; name/description optional.
+    [[ -n ${tier_map:-} ]] || return 0
+    local line tier id name desc TIER
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}     # ltrim
+        [[ -n $line && $line != \#* ]] || continue
+        # split off the id field, then optional | Name | desc
+        local rest="${line#* }" head="${line%% *}"
+        tier=$head
+        if [[ $rest == *"|"* ]]; then
+            id=${rest%%|*}; id=${id%"${id##*[![:space:]]}"}   # rtrim id
+            local tail=${rest#*|}
+            name=${tail%%|*}; name=${name#"${name%%[![:space:]]*}"}; name=${name%"${name##*[![:space:]]}"}
+            if [[ $tail == *"|"* ]]; then
+                desc=${tail#*|}; desc=${desc#"${desc%%[![:space:]]*}"}; desc=${desc%"${desc##*[![:space:]]}"}
+            else desc=""; fi
+        else
+            id=${rest%"${rest##*[![:space:]]}"}; name=""; desc=""
+        fi
+        [[ -n $tier && -n $id ]] || continue
+        case $tier in opus|sonnet|haiku|fable) ;; *) continue ;; esac
+        TIER=${tier^^}
+        LAUNCH_ENV+=("ANTHROPIC_DEFAULT_${TIER}_MODEL=$id")
+        [[ -n $name ]] && LAUNCH_ENV+=("ANTHROPIC_DEFAULT_${TIER}_MODEL_NAME=$name")
+        [[ -n $desc ]] && LAUNCH_ENV+=("ANTHROPIC_DEFAULT_${TIER}_MODEL_DESCRIPTION=$desc")
+    done <<< "$tier_map"
+}
+
+add_subagent_env() {
+    # Remembered subagent model for this provider -> CLAUDE_CODE_SUBAGENT_MODEL,
+    # which Claude Code 2.1.220 treats as an override of the tool/frontmatter
+    # model (decompiled L8y/VMs); "inherit" (the default) sets nothing.
+    local sa; sa=$(state_get "subagent__$provider" inherit)
+    [[ -n $sa && $sa != inherit ]] || return 0
+    LAUNCH_ENV+=("CLAUDE_CODE_SUBAGENT_MODEL=$sa")
 }
 
 TUNE_ENV=()
@@ -1590,6 +1664,7 @@ render() {
     ((${#hid[@]})) && mval+=" · ${#hid[@]} hidden"
     printf '  model       %-32s [m]\n' "$mval"
     printf '  effort      %-32s [e]\n' "$(resolve_effort)"
+    printf '  subagent    %-32s [a]\n' "$(tui_row_value subagent)"
     printf '  hooks       %-32s [h]\n' "$(state_get hooks on)${HOOKS_INFO:+ ($HOOKS_INFO)}"
     printf '  sys prompt  %-32s [s]\n' "$(tui_row_value prompt)"
     printf '  no CLAUDE.md %-31s [n]\n' "$(state_get nomd off)"
@@ -1627,6 +1702,7 @@ menu_plain() {
             p)      pick_provider; update_info_line ;;
             m)      pick_model ;;
             e)      cycle_effort_dir 1 ;;
+            a)      cycle_subagent_dir 1 ;;
             u)      refresh_models manual; update_info_line force ;;
             h)      toggle hooks on ;;
             s)      cycle_prompt_dir 1 ;;
@@ -1737,6 +1813,7 @@ tui_row_label() {
         provider) printf 'Provider' ;;
         model)    printf 'Model' ;;
         effort)   printf 'Effort' ;;
+        subagent) printf 'Subagent model' ;;
         hooks)    printf 'Hooks' ;;
         prompt)   printf 'System prompt' ;;
         nomd)     printf 'No CLAUDE.md' ;;
@@ -1748,7 +1825,7 @@ tui_row_label() {
 
 tui_row_adjustable() {
     case $1 in
-        provider | model | effort | hooks | prompt | nomd | safe) return 0 ;;
+        provider | model | effort | subagent | hooks | prompt | nomd | safe) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -1772,6 +1849,11 @@ tui_row_value() {
         effort)
             v=$(resolve_effort)
             printf '%s' "${v:--}"
+            ;;
+        subagent)
+            v=$(current_subagent)
+            if [[ $v == inherit ]]; then printf 'inherit (per-agent default)'
+            else printf '%s' "$v"; fi
             ;;
         hooks)
             v=$(state_get hooks on)
@@ -1866,6 +1948,19 @@ cycle_prompt_dir() {
     state_set prompt "${opts[$(((i + n + dir) % n))]}"
 }
 
+cycle_subagent_dir() {
+    local dir=$1 cur i n opts=() j
+    mapfile -t opts < <(subagent_options)
+    n=${#opts[@]}
+    ((n)) || return 0
+    cur=$(current_subagent)
+    i=0
+    for j in "${!opts[@]}"; do
+        [[ ${opts[$j]} == "$cur" ]] && { i=$j; break; }
+    done
+    state_set "subagent__$provider" "${opts[$(((i + n + dir) % n))]}"
+}
+
 cycle_provider() {
     local dir=$1 ids=() i j cand n
     mapfile -t ids < <(provider_ids)
@@ -1905,6 +2000,7 @@ tui_adjust() {
         provider)       cycle_provider "$2" ;;
         model)          cycle_model "$2" ;;
         effort)         cycle_effort_dir "$2" ;;
+        subagent)       cycle_subagent_dir "$2" ;;
         hooks)          toggle hooks on ;;
         prompt)         cycle_prompt_dir "$2" ;;
         nomd)           toggle nomd off ;;
@@ -2044,6 +2140,7 @@ tui_enter() {
         provider) tui_pick_provider ;;
         model)    tui_pick_model ;;
         effort)   cycle_effort_dir 1 ;;
+        subagent) tui_pick_subagent ;;
         hooks)    tui_pick_hooks ;;
         prompt)   tui_pick_prompt ;;
         nomd)     toggle nomd off ;;
@@ -2071,6 +2168,26 @@ tui_pick_prompt() {
     done
     tui_select "system prompt · ${system_prompt_mode}s the default" "" "$sel" "${items[@]}" || return 0
     state_set prompt "${opts[$TUI_CHOICE]}"
+}
+
+tui_pick_subagent() {
+    # Pick the model subagents run on: "inherit" or any enabled model.
+    # Exports CLAUDE_CODE_SUBAGENT_MODEL at launch (empty for inherit).
+    local -a opts=() items=()
+    mapfile -t opts < <(subagent_options)
+    ((${#opts[@]} > 1)) || { TUI_MSG="provider $provider has only one model"; return 0; }
+    local cur o sel=0
+    cur=$(current_subagent)
+    for o in "${!opts[@]}"; do
+        [[ ${opts[$o]} == "$cur" ]] && sel=$o
+        if [[ ${opts[$o]} == inherit ]]; then
+            items+=("inherit  ${C_DIM}(each subagent uses its own model)${C_RESET}")
+        else
+            items+=("${opts[$o]}")
+        fi
+    done
+    tui_select "subagent model · runs Task/subagents on this model" "" "$sel" "${items[@]}" || return 0
+    state_set "subagent__$provider" "${opts[$TUI_CHOICE]}"
 }
 
 tui_pick_hooks() {
@@ -2125,7 +2242,7 @@ menu_tui() {
         [[ -n ${SESS_IDS[$k]-} ]] && TUI_ROWS+=("resume$k")
     done
     ((RESUME_COUNT > 4)) && TUI_ROWS+=(resume)
-    TUI_ROWS+=(provider model effort hooks prompt nomd safe refresh quit)
+    TUI_ROWS+=(provider model effort subagent hooks prompt nomd safe refresh quit)
     n=${#TUI_ROWS[@]}
     init_colors
     tui_setup
@@ -2147,6 +2264,7 @@ menu_tui() {
             p)           tui_pick_provider ;;
             m)           tui_pick_model ;;
             e)           cycle_effort_dir 1 ;;
+            a)           tui_pick_subagent ;;
             u)           TUI_MSG=$(refresh_models manual); update_info_line force ;;
             h)           toggle hooks on ;;
             s)           tui_pick_prompt ;;
