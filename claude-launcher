@@ -362,6 +362,64 @@ provider_info() {
 }
 EOF
 
+    [[ -e $PROVIDER_DIR/qwen.conf ]] || cat >"$PROVIDER_DIR/qwen.conf" <<'EOF'
+# Qwen (Alibaba DashScope, international) over its native Anthropic-
+# compatible endpoint. No proxy, like DeepSeek/Moonshot. Endpoint and
+# Bearer auth verified live 2026-08-03. Uses DASHSCOPE_API_KEY from
+# ~/.bashrc.
+name="Qwen (DashScope)"
+base_url="https://dashscope-intl.aliyuncs.com/apps/anthropic"
+auth_token_env="DASHSCOPE_API_KEY"
+# The endpoint accepts a Bearer token (verified), the ANTHROPIC_AUTH_TOKEN
+# default.
+auth_var="ANTHROPIC_AUTH_TOKEN"
+# qwen3.8-max is a 1M-context model (Alibaba docs), so append [1m].
+auto_1m=1
+# The /apps/anthropic path has no /models route (checked 2026-08-03), so
+# context is declared here. 1000000 = the model's context WINDOW (docs);
+# the thinking-mode input sub-limit is 983,616, but the window is what CC
+# should track for auto-compaction and the [1m] decision. Live probe
+# 2026-08-03 accepted ~300K-token inputs without complaint.
+context_map="
+qwen3.8-max 1000000
+qwen3.7-max 1000000
+qwen3.7-plus 1000000
+"
+# Output cap pinned live to exactly 131072 (131073 is rejected,
+# 2026-08-03); Alibaba docs agree (131K max output).
+max_output_tokens=131072
+# NO --effort. Alibaba's docs list low/high/xhigh for this model, but the
+# /apps/anthropic endpoint currently IGNORES output_config.effort entirely
+# (even a bogus value returns 200, probed 2026-08-03) - thinking runs at
+# the model default regardless. Wiring effort levels would be a control
+# that does nothing, so it is omitted until the endpoint honors it.
+efforts=""
+# Discovery uses the OpenAI-compatible list (the Anthropic path has none).
+# models_filter keeps text qwen max/plus ids out of the 150+ multimodal
+# entries (image/omni/vl/audio excluded).
+models_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models"
+models_auth_env="DASHSCOPE_API_KEY"
+models_filter="^qwen[0-9.]*-(max|plus)(-[0-9]|$)"
+models=(
+    "qwen3.8-max"
+    "qwen3.7-max"
+    "qwen3.7-plus"
+)
+# No balance/usage endpoint exposed to API keys (checked 2026-08-03), so
+# provider_info reports key validity only.
+provider_info() {
+    local key="${!auth_token_env-}"
+    [[ -n $key ]] || { printf 'DASHSCOPE_API_KEY unset'; return 0; }
+    if curl -sf --max-time 5 -o /dev/null \
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models" \
+        -H "authorization: Bearer $key" 2>/dev/null; then
+        printf 'key ok'
+    else
+        printf 'key FAILED'
+    fi
+}
+EOF
+
     [[ -e $CL_HOME/litellm.yaml ]] || cat >"$CL_HOME/litellm.yaml" <<'EOF'
 # REFERENCE ONLY. The launcher no longer uses this file at run time: for
 # openai and grok it generates a fresh per-session config from the active
