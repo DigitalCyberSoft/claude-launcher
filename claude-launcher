@@ -610,8 +610,50 @@ migrate_state() {
     fi
 }
 
-state_get() { printf '%s' "${STATE[$1]-$2}"; }
-state_set() { STATE[$1]=$2; save_state; }
+# Per-cwd settings. Session-shaping choices are remembered per working
+# directory: a directory keeps its own provider and, under that provider,
+# its model/effort/subagent/prompt/toggles. Reads fall through cwd ->
+# global -> caller default; writes to a scoped key update BOTH the cwd
+# layer (so this dir diverges) and the global key (so a NEW dir inherits
+# the current values). Scoped keys are "<key>@@<cwd-tag>", tag = a short
+# hash of the absolute cwd (filesystem/./=-safe, collision-resistant).
+CWD_TAG=""
+cwd_tag() {
+    [[ -n $CWD_TAG ]] && { printf '%s' "$CWD_TAG"; return 0; }
+    local h
+    h=$(printf '%s' "$PWD" | sha1sum 2>/dev/null | cut -c1-12) \
+        || h=$(printf '%s' "$PWD" | cksum | tr -d ' ')
+    CWD_TAG=$h
+    printf '%s' "$CWD_TAG"
+}
+
+# Keys that are remembered per-cwd. Everything else (e.g. per-model
+# disabled lists, discovery caches) stays global.
+is_scoped_key() {
+    case $1 in
+        provider|effort|hooks|hooks_skip|prompt|nomd|safe) return 0 ;;
+        model__*|subagent__*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+state_get() {
+    # Scoped keys: prefer the cwd value, else the global value, else $2.
+    if is_scoped_key "$1"; then
+        local sk="$1@@$(cwd_tag)"
+        if [[ -n ${STATE[$sk]+x} ]]; then printf '%s' "${STATE[$sk]}"; return 0; fi
+    fi
+    printf '%s' "${STATE[$1]-$2}"
+}
+
+state_set() {
+    # Scoped keys write the cwd layer AND the global (so new dirs inherit).
+    if is_scoped_key "$1"; then
+        STATE["$1@@$(cwd_tag)"]=$2
+    fi
+    STATE[$1]=$2
+    save_state
+}
 
 save_state() {
     local tmp="$STATE_FILE.tmp.$$" k
@@ -1833,7 +1875,11 @@ menu_plain() {
         IFS= read -rsn1 key || { printf '\n'; exit 1; }
         printf '\n'
         case $key in
-            '' | f) launch_session "" ;;
+            '')  # bare Enter prefers continuing this directory's session
+                if [[ -n $CONT_INFO ]]; then launch_session --continue
+                else launch_session ""; fi
+                ;;
+            f)   launch_session "" ;;
             c)
                 if [[ -n $CONT_INFO ]]; then
                     launch_session --continue
@@ -2406,6 +2452,12 @@ menu_tui() {
     ((RESUME_COUNT > 4)) && TUI_ROWS+=(resume)
     TUI_ROWS+=(provider model effort subagent hooks prompt nomd safe refresh quit)
     n=${#TUI_ROWS[@]}
+    # Prefer continuing: when this directory has a resumable session, land
+    # the cursor on the Continue row instead of Start fresh, so Enter
+    # continues by default.
+    for k in "${!TUI_ROWS[@]}"; do
+        [[ ${TUI_ROWS[$k]} == continue ]] && { sel=$k; break; }
+    done
     init_colors
     tui_setup
     while :; do

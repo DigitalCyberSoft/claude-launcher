@@ -84,9 +84,11 @@ Over a pipe or a dumb terminal it falls back to a plain line menu with the same 
 
 Your provider, model, effort, subagent model, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, subagent `inherit`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
 
+**Settings are remembered per directory.** The session-shaping choices — provider and, under it, model / effort / subagent / system prompt / hooks / no-CLAUDE.md / safe mode — are stored per working directory, so one project can default to Grok while another defaults to Opus, and each restores its own setup when you `cd` back. A directory you open for the first time inherits your current (last-used) values, then diverges as you change things there. Per-model disable lists stay global. Existing flat state keeps working unchanged.
+
 ### Sessions
 
-The **Continue** row shows the title and age of the session `--continue` would resume (it is scoped to the current directory) and is hidden when the directory has no sessions. Below it, up to the next three sessions appear as direct **Resume** rows that launch `claude --resume=<session-id>`. An "All sessions" picker appears only when more sessions exist than are shown, and the whole Resume group is hidden when Continue already covers the only session.
+The **Continue** row shows the title and age of the session `--continue` would resume (it is scoped to the current directory) and is hidden when the directory has no sessions. When the directory has a resumable session, the menu **starts with the cursor on Continue** (and in the plain menu, a bare Enter continues), so pressing Enter picks up where you left off; press `f` to start fresh instead. Below Continue, up to the next three sessions appear as direct **Resume** rows that launch `claude --resume=<session-id>`. An "All sessions" picker appears only when more sessions exist than are shown, and the whole Resume group is hidden when Continue already covers the only session.
 
 Titles come from the `ai-title` records in `~/.claude/projects/<cwd>/*.jsonl`. The header line repeats this directory's last session, or, when there is none, the newest session anywhere, labeled with its project and marked "not continuable here".
 
