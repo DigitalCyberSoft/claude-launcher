@@ -1,6 +1,6 @@
 # claude-launcher
 
-An arrow-key menu front-end for [Claude Code](https://claude.com/product/claude-code) that remembers your model, effort level, and provider, launches fresh/continue/resume sessions, and routes the same Claude Code binary to Anthropic, Moonshot (Kimi), OpenAI, or Grok.
+An arrow-key menu front-end for [Claude Code](https://claude.com/product/claude-code) that remembers your model, effort level, and provider, launches fresh/continue/resume sessions, and routes the same Claude Code binary to Anthropic, Moonshot (Kimi), DeepSeek, Qwen, OpenAI, or Grok.
 
 Run `claude` with no arguments and you get a menu. Run it with arguments and it passes straight through to the real binary with your remembered settings applied, so `claude -c`, `claude -p '...'`, and `claude mcp ...` keep working exactly as before.
 
@@ -172,7 +172,7 @@ then exports the matching variable only for runs where you asked to skip that ev
 
 ## Status line
 
-The launcher seeds `~/.config/claude-launcher/statusline.sh`, a status line matching Claude Code's own segments (model, context tokens with a red mark past 90%, 5h/7d rate limits) plus one account-data segment for the active provider — Moonshot balance, or Anthropic usage and credits. It is cached for 15 minutes in `cache/info__<provider>`, the same cache the menu uses.
+The launcher seeds `~/.config/claude-launcher/statusline.sh`, a status line matching Claude Code's own segments (model, context tokens with a red mark past 90%, 5h/7d rate limits) plus one account-data segment for the active provider — Moonshot balance, or Anthropic usage and credits. It is cached for 24 hours in `cache/info__<provider>`, the same cache the menu uses.
 
 It is injected via `--settings` for third-party providers only, so on Anthropic your existing `~/.claude/settings.json` status line is used unchanged. With hooks toggled off the status line is suppressed on every provider, because Claude Code's `disableAllHooks` also disables the custom status line.
 
@@ -207,11 +207,14 @@ Model, effort, subagent, tier, and toggle settings all apply on the menu launch 
 
 ## Provider account data
 
-A provider conf may define a `provider_info()` function that returns one line, cached 15 minutes and shown both in the menu and the status line:
+A provider conf may define a `provider_info()` function that returns one line, cached 24 hours and shown both in the menu and the status line:
 
 - **anthropic**: subscription usage — 5h/7d remaining percentages and extra-usage credits — from the same unofficial OAuth endpoint the Claude Code status line uses (`api.anthropic.com/api/oauth/usage`; not in the public API docs, so treat it as breakable, and it is not available to plain API keys).
 - **moonshot**: account balance from its documented `/v1/users/me/balance` endpoint.
-- **openai / grok**: proxy reachability plus key validity only. OpenAI exposes no balance to normal API keys, and xAI exposes key status only.
+- **deepseek**: account balance from its documented `/user/balance` endpoint.
+- **qwen / openai / grok**: key validity only (no balance is exposed to normal API keys).
+
+Fetching this line never blocks the menu. When you switch to a provider whose cached line is missing or older than 24 hours, the launcher shows the last-known value immediately and refreshes in the background, repainting the line in place a moment later. Model discovery on menu start runs in the background the same way, so the menu appears instantly rather than waiting on a network round-trip. Quitting or launching never waits on an in-flight fetch.
 
 ---
 

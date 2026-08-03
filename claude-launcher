@@ -485,7 +485,7 @@ models_filter=""                   # regex keeping only matching discovered ids
 # max_output_tokens=128000         # raise CC's 32000 unknown-model default
 models=("model-a" "model-b")
 # extra_env=("FOO=bar")            # extra environment for claude
-# Optional: one line of account data for the menu (cached 15 min).
+# Optional: one line of account data for the menu (cached 24h).
 # provider_info() { curl -sf --max-time 6 ... | jq -r '...'; }
 EOF
 
@@ -494,7 +494,7 @@ EOF
 # claude-launcher statusline: same segments as a stock Anthropic
 # statusline (model, context usage, rate limits), plus one account-data
 # segment from the active provider's provider_info() - balance for
-# Moonshot, usage/credits for Anthropic - cached 15 min in
+# Moonshot, usage/credits for Anthropic - cached 24h in
 # cache/info__<provider> (shared with the launcher menu).
 input=$(cat)
 model=$(printf '%s' "$input" | jq -r '.model.display_name // empty')
@@ -923,6 +923,21 @@ maybe_auto_refresh() {
     fi
 }
 
+maybe_auto_refresh_async() {
+    # Background variant for the menu load path: discovery updates the
+    # context/efforts caches and the "new models" list, none of which the
+    # first paint needs, so run it detached and let the menu appear now.
+    # Fresh results are picked up on the next [u], provider revisit, or run.
+    [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]] && return 0
+    local known="$CACHE_DIR/known__$provider"
+    if [[ ! -s $known || -n $(find "$known" -mmin +1440 2>/dev/null) ]]; then
+        # stdin from /dev/null too: else the detached job holds an inherited
+        # pipe/terminal open and the parent's exit/exec waits on it.
+        ( refresh_models auto ) </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+}
+
 list_models() {
     # $1 = suggested | all. conf models first, then discovered extras;
     # dedup on the id with any [suffix] stripped.
@@ -1118,20 +1133,44 @@ INFO_LINE=""
 CONT_INFO=""
 RESUME_COUNT=0
 
+INFO_TTL_MIN=1440   # account-line cache lifetime (24h)
+INFO_BG_PID=""       # pid of an in-flight background provider_info fetch
+INFO_BG_PROVIDER=""  # which provider that fetch is for
+
 provider_info_line() {
     # One line of provider account data from the conf's optional
-    # provider_info() hook. Cached for 15 minutes per provider.
-    local cache="$CACHE_DIR/info__$provider" out
+    # provider_info() hook. NON-BLOCKING: returns the cached line
+    # immediately (even if stale/empty) and, on a cache miss, spawns the
+    # provider_info() curl in the BACKGROUND so switching providers never
+    # waits on the network. The menu loop repaints when the background
+    # fetch lands (see poll_info_bg). Cached INFO_TTL_MIN minutes.
+    local cache="$CACHE_DIR/info__$provider"
     declare -F provider_info >/dev/null || return 0
-    if [[ -s $cache && -z $(find "$cache" -mmin +15 2>/dev/null) ]]; then
+    [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]] && return 0
+    mkdir -p "$CACHE_DIR"
+    # Fresh cache: use it, no fetch.
+    if [[ -s $cache && -z $(find "$cache" -mmin +"$INFO_TTL_MIN" 2>/dev/null) ]]; then
         cat "$cache"
         return 0
     fi
-    [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]] && return 0
-    mkdir -p "$CACHE_DIR"
-    out=$(provider_info 2>/dev/null) || out=""
-    printf '%s' "$out" >"$cache"
-    printf '%s' "$out"
+    # Stale/missing: kick off a background refresh (unless one is already
+    # running for this provider) and return whatever we have now.
+    if [[ $INFO_BG_PROVIDER != "$provider" ]] || ! kill -0 "$INFO_BG_PID" 2>/dev/null; then
+        local c=$cache
+        # Redirect stdin/stdout/stderr away so the detached fetch never
+        # holds the terminal or an inherited pipe open (which would make
+        # the parent's exit/exec wait on it).
+        ( out=$(provider_info 2>/dev/null) || out=""
+          printf '%s' "$out" >"$c.tmp.$$" && mv "$c.tmp.$$" "$c" ) \
+          </dev/null >/dev/null 2>&1 &
+        INFO_BG_PID=$!
+        INFO_BG_PROVIDER=$provider
+        # Detach so quitting the menu or exec'ing claude never waits on the
+        # fetch. The menu polls the cache file (info_bg_pending) instead.
+        disown "$INFO_BG_PID" 2>/dev/null || true
+    fi
+    [[ -s $cache ]] && cat "$cache"   # last-known value while it refreshes
+    return 0
 }
 
 PROVIDERS_LINE=""
@@ -1157,6 +1196,23 @@ update_info_line() {
     PROVIDERS_LINE=$(providers_line)
 }
 
+info_bg_pending() {
+    # True while a background provider_info fetch for the current provider
+    # is still running: the menu should keep polling to repaint when done.
+    [[ $INFO_BG_PROVIDER == "$provider" ]] && kill -0 "$INFO_BG_PID" 2>/dev/null
+}
+
+refresh_info_from_cache() {
+    # Re-read the cached account line for the current provider. Returns 0
+    # (changed) when INFO_LINE differs from what is on screen, so the caller
+    # knows to repaint.
+    local cache="$CACHE_DIR/info__$provider" now=""
+    [[ -s $cache ]] && now=$(cat "$cache")
+    [[ $now == "$INFO_LINE" ]] && return 1
+    INFO_LINE=$now
+    return 0
+}
+
 # --------------------------------------------------------------- launch
 
 LAUNCH_ENV=()
@@ -1180,8 +1236,40 @@ build_provider_env() {
     [[ -n $default_haiku_model ]] && LAUNCH_ENV+=("ANTHROPIC_DEFAULT_HAIKU_MODEL=$default_haiku_model")
     add_tier_env
     add_subagent_env
+    fill_default_tiers "$1"
     ((${#extra_env[@]})) && LAUNCH_ENV+=("${extra_env[@]}")
     return 0
+}
+
+fill_default_tiers() {
+    # $1 = the resolved main model. For a third-party provider, ANY model
+    # tier Claude Code might resolve (opus/sonnet/haiku/fable) that is not
+    # already set - by default_haiku_model, tier_map, or a prior var - MUST
+    # point at one of THIS provider's models, never Claude Code's built-in
+    # fallback. Otherwise Plan/subagent/background tasks resolve e.g. the
+    # sonnet tier to the built-in "claude-sonnet-5" and send that Anthropic
+    # id to the third-party endpoint -> 400 "invalid model" (observed on
+    # the LiteLLM/OpenAI path 2026-08-03). Same for the subagent model.
+    # The main model (bare of any [1m] suffix; tier vars must not carry it)
+    # is the safe default. Explicit tier_map / subagent choices win because
+    # they are already in LAUNCH_ENV and are skipped here.
+    local main=${1%%\[*} tier TIER e have
+    for tier in opus sonnet haiku fable; do
+        TIER=${tier^^}
+        have=0
+        for e in "${LAUNCH_ENV[@]}"; do
+            [[ $e == "ANTHROPIC_DEFAULT_${TIER}_MODEL="* ]] && { have=1; break; }
+        done
+        ((have)) || LAUNCH_ENV+=("ANTHROPIC_DEFAULT_${TIER}_MODEL=$main")
+    done
+    # Subagent: if not already pinned (add_subagent_env only sets it when
+    # the user chose a specific model), default it to the main model so
+    # subagents never fall back to an Anthropic id either.
+    have=0
+    for e in "${LAUNCH_ENV[@]}"; do
+        [[ $e == "CLAUDE_CODE_SUBAGENT_MODEL="* ]] && { have=1; break; }
+    done
+    ((have)) || LAUNCH_ENV+=("CLAUDE_CODE_SUBAGENT_MODEL=$main")
 }
 
 add_tier_env() {
@@ -1688,7 +1776,7 @@ pick_provider() {
         provider=${ids[$((sel - 1))]}
         state_set provider "$provider"
         load_provider "$provider"
-        maybe_auto_refresh
+        maybe_auto_refresh_async
     fi
 }
 
@@ -1733,7 +1821,7 @@ render() {
 
 menu_plain() {
     local key
-    maybe_auto_refresh
+    maybe_auto_refresh_async
     collect_sessions
     collect_hook_events
     SESSION_HEADER=$(session_header)
@@ -1848,8 +1936,24 @@ tui_teardown() {
 
 KEY=""
 tui_read_key() {
-    local k extra
-    IFS= read -rsn1 k || return 1
+    # Reads one key. While a background provider_info fetch is pending, the
+    # read is given a short timeout and, on timeout, sets KEY to the sentinel
+    # $'\x00' (repaint request) so the menu loop redraws the freshened
+    # account line without waiting on a keypress. Returns 1 only on EOF.
+    local k extra rc
+    while :; do
+        if info_bg_pending; then
+            IFS= read -rsn1 -t 0.15 k; rc=$?
+            if ((rc > 128)); then          # timed out, no key
+                if refresh_info_from_cache; then KEY=$'\x00'; return 0; fi
+                continue                   # still pending, nothing new: keep waiting
+            fi
+            ((rc != 0)) && return 1        # EOF/error
+        else
+            IFS= read -rsn1 k || return 1
+        fi
+        break
+    done
     if [[ $k == $'\e' ]]; then
         while IFS= read -rsn1 -t 0.01 extra; do
             k+=$extra
@@ -2033,7 +2137,7 @@ cycle_provider() {
         provider=$cand
         state_set provider "$provider"
         load_provider "$provider"
-        TUI_MSG=$(maybe_auto_refresh)
+        maybe_auto_refresh_async
         update_info_line
         return 0
     done
@@ -2132,7 +2236,7 @@ tui_pick_provider() {
     provider=${ids[$TUI_CHOICE]}
     state_set provider "$provider"
     load_provider "$provider"
-    TUI_MSG=$(maybe_auto_refresh)
+    maybe_auto_refresh_async
     update_info_line
 }
 
@@ -2288,7 +2392,7 @@ TUI_ROWS=()
 
 menu_tui() {
     local sel=0 n k
-    TUI_MSG=$(maybe_auto_refresh)
+    maybe_auto_refresh_async
     collect_sessions
     collect_hook_events
     SESSION_HEADER=$(session_header)
