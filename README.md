@@ -39,17 +39,21 @@ Claude Code is one binary, but day to day you want to:
 
 Requirements: `bash`, `curl`, `jq`. Claude Code itself does **not** need to be installed first — the launcher discovers an existing build and, if there is none, offers to install one (`claude install`).
 
-**RPM (Fedora / COPR)** — installs the launcher as `/usr/bin/claude`, so `claude` becomes the launcher system-wide:
+**RPM (Fedora / COPR)** — installs the launcher as `/usr/bin/claude`, so `claude` becomes the launcher system-wide, and installs global bash completion for `claude`:
 
 ```sh
 sudo dnf install claude-launcher      # from the DigitalCyberSoft COPR
 ```
+
+The completion lands in `/usr/share/bash-completion/completions/claude` and loads automatically in new shells — no `~/.bashrc` sourcing. If you previously sourced Claude Code's own `~/.claude/completions/claude.bash` from your `~/.bashrc`, that line is now redundant and can be removed.
 
 **Alias (any shell, no root)** — point an alias at the script:
 
 ```sh
 git clone https://github.com/DigitalCyberSoft/claude-launcher.git
 echo "alias claude='$PWD/claude-launcher/claude-launcher'" >> ~/.bashrc
+# optional: load completion in this shell (the RPM does this globally)
+echo "source '$PWD/claude-launcher/completions/claude.bash'" >> ~/.bashrc
 source ~/.bashrc
 ```
 

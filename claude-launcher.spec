@@ -8,6 +8,9 @@ URL:            https://github.com/DigitalCyberSoft/claude-launcher
 Source0:        claude-launcher
 Source1:        README.md
 Source2:        LICENSE
+# The completion lives at completions/claude.bash in the repo; for COPR the
+# tarball flattens sources, so reference it by basename here.
+Source3:        claude.bash
 
 BuildArch:      noarch
 
@@ -49,14 +52,19 @@ or a per-session LiteLLM proxy.
 cp -p %{SOURCE0} .
 cp -p %{SOURCE1} .
 cp -p %{SOURCE2} .
+cp -p %{SOURCE3} .
 
 %install
 install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/claude
 install -D -m 0644 %{SOURCE1} %{buildroot}%{_datadir}/doc/%{name}/README.md
 install -D -m 0644 %{SOURCE2} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
+# Global bash completion for `claude`; loads automatically for interactive
+# shells (no ~/.bashrc sourcing needed).
+install -D -m 0644 %{SOURCE3} %{buildroot}%{_datadir}/bash-completion/completions/claude
 
 %files
 %{_bindir}/claude
+%{_datadir}/bash-completion/completions/claude
 %doc %{_datadir}/doc/%{name}/README.md
 %license %{_datadir}/licenses/%{name}/LICENSE
 
@@ -73,3 +81,6 @@ install -D -m 0644 %{SOURCE2} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
   version / npm user / npm system / switch active build)
 - find_real_claude never resolves to a launcher (signature check), so the
   wrapper never execs itself
+- Ships global bash completion for `claude`
+  (/usr/share/bash-completion/completions/claude), refreshed to 2.1.222
+  flags/subcommands and completing the launcher's provider model ids
