@@ -5,12 +5,7 @@ Summary:        Menu front-end that becomes the primary `claude`, wrapping Claud
 
 License:        MIT
 URL:            https://github.com/DigitalCyberSoft/claude-launcher
-Source0:        claude-launcher
-Source1:        README.md
-Source2:        LICENSE
-# The completion lives at completions/claude.bash in the repo; for COPR the
-# tarball flattens sources, so reference it by basename here.
-Source3:        claude.bash
+Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 
 BuildArch:      noarch
 
@@ -45,33 +40,26 @@ configuration under ~/.config/claude-launcher.
 
 Providers beyond Anthropic (Moonshot/Kimi, DeepSeek, Qwen, OpenAI, Grok)
 are supported by routing the same binary through the appropriate endpoint
-or a per-session LiteLLM proxy.
+or a per-session LiteLLM proxy. A global bash completion for `claude` is
+installed as well.
 
 %prep
-# Nothing to unpack; sources are installed directly.
-cp -p %{SOURCE0} .
-cp -p %{SOURCE1} .
-cp -p %{SOURCE2} .
-cp -p %{SOURCE3} .
+%autosetup -n %{name}-%{version}
 
 %install
-install -D -m 0755 %{SOURCE0} %{buildroot}%{_bindir}/claude
-install -D -m 0644 %{SOURCE1} %{buildroot}%{_datadir}/doc/%{name}/README.md
-install -D -m 0644 %{SOURCE2} %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
+install -D -m 0755 claude-launcher %{buildroot}%{_bindir}/claude
 # Global bash completion for `claude`; loads automatically for interactive
 # shells (no ~/.bashrc sourcing needed).
-install -D -m 0644 %{SOURCE3} %{buildroot}%{_datadir}/bash-completion/completions/claude
+install -D -m 0644 completions/claude.bash \
+    %{buildroot}%{_datadir}/bash-completion/completions/claude
+install -D -m 0644 README.md %{buildroot}%{_datadir}/doc/%{name}/README.md
+install -D -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 
 %files
 %{_bindir}/claude
 %{_datadir}/bash-completion/completions/claude
 %doc %{_datadir}/doc/%{name}/README.md
 %license %{_datadir}/licenses/%{name}/LICENSE
-
-%post
-# On a fresh system with no Claude Code yet, the first `claude` invocation
-# offers to install one. Nothing to do here.
-:
 
 %changelog
 * Wed Aug 05 2026 DigitalCyberSoft <claude@dcs.io> - 0.1.0-1
