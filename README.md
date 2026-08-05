@@ -37,24 +37,48 @@ Claude Code is one binary, but day to day you want to:
 
 ## Install
 
-Requirements: `bash`, `curl`, `jq`, and Claude Code already installed (`claude` on your `PATH`).
+Requirements: `bash`, `curl`, `jq`. Claude Code itself does **not** need to be installed first — the launcher discovers an existing build and, if there is none, offers to install one (`claude install`).
+
+**RPM (Fedora / COPR)** — installs the launcher as `/usr/bin/claude`, so `claude` becomes the launcher system-wide:
+
+```sh
+sudo dnf install claude-launcher      # from the DigitalCyberSoft COPR
+```
+
+**Alias (any shell, no root)** — point an alias at the script:
 
 ```sh
 git clone https://github.com/DigitalCyberSoft/claude-launcher.git
-cd claude-launcher
-
-# Point your existing `claude` alias (or a new one) at the script:
-echo "alias claude='$PWD/claude-launcher'" >> ~/.bashrc
+echo "alias claude='$PWD/claude-launcher/claude-launcher'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
-First run seeds `~/.config/claude-launcher` with a config file, provider definitions, a status line, and a LiteLLM proxy config. Nothing outside that directory is touched until you actually launch a session.
+Either way, first use seeds `~/.config/claude-launcher` with a config file, provider definitions, a status line, and a LiteLLM proxy config. Nothing outside that directory is touched until you actually launch a session.
 
 Try it without launching anything:
 
 ```sh
 CLAUDE_LAUNCHER_DRY_RUN=1 claude      # prints the exact command it would run
 ```
+
+### Installing / switching the Claude Code build
+
+The launcher runs the real Claude Code binary underneath and finds it automatically: an explicit `claude_bin` in the config, else the newest native build under `~/.local/share/claude/versions`, else an npm install, else any non-launcher `claude` on `PATH`. It identifies its own copies by a signature line, so a launcher installed *as* `claude` never execs itself.
+
+`claude install` opens a chooser:
+
+```
+Claude Code build
+  installed: native 2.1.222 · active: .../versions/2.1.222
+
+  1) native - install latest (claude.ai/install.sh; ~/.local, self-updating)
+  2) native - install a specific/older version (e.g. 2.1.220)
+  3) npm - user install, no sudo (~/.npm-global, updates in place)
+  4) npm - system install (npm -g, may need sudo)
+  5) switch active build (native <-> npm) without reinstalling
+```
+
+Switching or pinning a build only repoints the launcher's config (`claude_bin` / `claude_channel` / `claude_version`); it never touches `~/.claude` (settings, sessions, credentials) or `~/.config/claude-launcher`, and it does not delete previously installed native versions. On a system with no Claude Code at all, the first bare `claude` offers the same chooser before launching.
 
 ---
 

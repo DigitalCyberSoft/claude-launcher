@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# claude-launcher-signature: front-end wrapper for Claude Code. This exact
+# comment marks a file as a launcher so a launcher installed AS `claude`
+# (e.g. /usr/bin/claude from the RPM) never resolves to and execs itself
+# or another launcher copy when searching for the real binary.
 # claude-launcher - interactive front-end for Claude Code.
 #
 # Bare `claude` (aliased to this script) shows a menu: session type
@@ -59,6 +63,66 @@ SUBCOMMANDS=(agents auth auto-mode doctor gateway install mcp plugin plugins
 
 die() { printf 'claude-launcher: %s\n' "$*" >&2; exit 1; }
 
+# ------------------------------------------------- real-binary discovery
+
+LAUNCHER_SIG="claude-launcher-signature"
+
+is_launcher() {
+    # True if $1 is a claude-launcher script (not the real Claude Code
+    # binary). Checks the signature line in the first few KB; the real
+    # binary is a ~280MB compiled executable that never contains it. Used
+    # so a launcher installed AS `claude` never execs itself or a sibling
+    # launcher copy.
+    [[ -r $1 ]] || return 1
+    head -c 4096 "$1" 2>/dev/null | grep -q "$LAUNCHER_SIG"
+}
+
+native_versions_dir() { printf '%s' "$HOME/.local/share/claude/versions"; }
+
+latest_native() {
+    # Newest installed native version binary, or empty. Versions are named
+    # like 2.1.222; sort -V picks the highest.
+    local d; d=$(native_versions_dir)
+    [[ -d $d ]] || return 0
+    local f; f=$(ls -1 "$d" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' \
+        | sort -V | tail -1)
+    [[ -n $f && -x $d/$f ]] && printf '%s' "$d/$f"
+}
+
+find_real_claude() {
+    # Locate the real Claude Code binary, never a launcher. Order:
+    #   1. claude_bin from config (explicit override), if it is not a launcher.
+    #   2. The pinned native version, if config names one (claude_version).
+    #   3. Newest native install under ~/.local/share/claude/versions.
+    #   4. npm installs: user prefix, then system prefix.
+    #   5. Any `claude` on PATH whose realpath is not a launcher.
+    # Prints the path, or nothing if only launcher(s) exist.
+    local c d p
+    if [[ -n ${claude_bin:-} ]]; then
+        if [[ -x $claude_bin ]] && ! is_launcher "$claude_bin"; then
+            printf '%s' "$claude_bin"; return 0
+        fi
+    fi
+    if [[ -n ${claude_version:-} ]]; then
+        c="$(native_versions_dir)/$claude_version"
+        [[ -x $c ]] && ! is_launcher "$c" && { printf '%s' "$c"; return 0; }
+    fi
+    c=$(latest_native)
+    [[ -n $c ]] && ! is_launcher "$c" && { printf '%s' "$c"; return 0; }
+    for p in "$HOME/.npm-global/bin/claude" \
+             "$(npm prefix -g 2>/dev/null)/bin/claude" \
+             "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"; do
+        [[ -n $p && -x $p ]] && ! is_launcher "$p" && { printf '%s' "$p"; return 0; }
+    done
+    while IFS= read -r p; do
+        [[ -x $p ]] || continue
+        d=$(readlink -f "$p" 2>/dev/null) || d=$p
+        is_launcher "$d" && continue
+        printf '%s' "$d"; return 0
+    done < <(type -a -p claude 2>/dev/null)
+    return 1
+}
+
 # ---------------------------------------------------------------- seeding
 
 seed_files() {
@@ -67,8 +131,19 @@ seed_files() {
     [[ -e $CONFIG_FILE ]] || cat >"$CONFIG_FILE" <<'EOF'
 # claude-launcher configuration (sourced by bash).
 
-# Path to the real claude binary. Empty = first `claude` in PATH.
+# Path to the real claude binary. Empty = auto-discover (config claude_bin,
+# then the newest native install under ~/.local/share/claude/versions, then
+# npm installs, then a non-launcher `claude` on PATH). Set by the installer
+# ([i] Install / switch build) when you switch between native and npm.
 claude_bin=""
+
+# Preferred Claude Code build: "native" or "npm". Informational; the
+# installer sets it and points claude_bin at the matching binary.
+claude_channel=""
+
+# Pin a specific native version (e.g. 2.1.220): find_real_claude uses
+# ~/.local/share/claude/versions/<claude_version> when set. Empty = newest.
+claude_version=""
 
 # System prompts. The "prompt" menu row cycles through "off" plus every
 # prompt discovered under system_prompt_dir, so you can switch between
@@ -576,12 +651,30 @@ EOF
 # ---------------------------------------------------------- config/state
 
 claude_bin=""
+claude_channel=""
+claude_version=""
 system_prompt_dir="$HOME/.claude/system-prompts"
 system_prompt_mode="replace"
 
 load_config() {
     # shellcheck disable=SC1090
     [[ -r $CONFIG_FILE ]] && . "$CONFIG_FILE"
+}
+
+config_set() {
+    # Persist key=$1 value=$2 into the config file, replacing an existing
+    # `key="..."` line or appending one. Also updates the live variable.
+    local key=$1 val=$2 tmp="$CONFIG_FILE.tmp.$$"
+    printf -v "$key" '%s' "$val"
+    mkdir -p "$CL_HOME"
+    if [[ -f $CONFIG_FILE ]] && grep -qE "^${key}=" "$CONFIG_FILE"; then
+        # rewrite the line, value quoted; awk avoids sed metachar issues
+        awk -v k="$key" -v v="$val" '
+            $0 ~ "^" k "=" { printf "%s=\"%s\"\n", k, v; next } { print }
+        ' "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE"
+    else
+        printf '%s="%s"\n' "$key" "$val" >>"$CONFIG_FILE"
+    fi
 }
 
 declare -A STATE=()
@@ -1728,6 +1821,150 @@ passthrough() {
     run_claude "${args[@]}"
 }
 
+# ------------------------------------------------------- install / switch
+#
+# The launcher can be the primary `claude` on a system (installed as
+# /usr/bin/claude by the RPM). It then owns installing, switching, and
+# pinning the real Claude Code build underneath, and picks it up via
+# find_real_claude. Nothing here touches ~/.claude (settings, sessions,
+# credentials) or ~/.config/claude-launcher (provider confs, per-cwd
+# state); switching a build only repoints claude_bin/claude_channel/
+# claude_version in the config.
+
+native_installer_url() { printf 'https://claude.ai/install.sh'; }
+
+install_native() {
+    # $1 = target: stable | latest | <version>. Uses Claude Code's own
+    # native installer (`<real> install <target>`) when a real binary is
+    # already present; otherwise bootstraps via the upstream install.sh.
+    # Older versions are supported by both paths.
+    local target=${1:-latest} real
+    real=$(find_real_claude || true)
+    if [[ -n $real ]]; then
+        printf 'claude-launcher: installing native %s via %s ...\n' "$target" "$real" >&2
+        "$real" install "$target" || { printf 'claude-launcher: native install failed\n' >&2; return 1; }
+    else
+        command -v curl >/dev/null 2>&1 || { printf 'claude-launcher: curl needed to bootstrap the native installer\n' >&2; return 1; }
+        printf 'claude-launcher: bootstrapping native install (%s) ...\n' "$target" >&2
+        # install.sh accepts a version argument; latest when omitted.
+        if [[ $target == latest || $target == stable ]]; then
+            curl -fsSL "$(native_installer_url)" | bash || return 1
+        else
+            curl -fsSL "$(native_installer_url)" | bash -s -- "$target" || return 1
+        fi
+    fi
+    config_set claude_channel native
+    if [[ $target =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        config_set claude_version "$target"
+    else
+        config_set claude_version ""
+    fi
+    config_set claude_bin ""   # let find_real_claude resolve the native dir
+    return 0
+}
+
+npm_pkg() { printf '@anthropic-ai/claude-code'; }
+
+install_npm() {
+    # $1 = scope: user | system. user -> a no-sudo prefix (~/.npm-global);
+    # system -> npm's configured global prefix (may need sudo).
+    local scope=${1:-user} prefix binpath
+    command -v npm >/dev/null 2>&1 || { printf 'claude-launcher: npm not found (need Node.js)\n' >&2; return 1; }
+    if [[ $scope == user ]]; then
+        prefix="$HOME/.npm-global"
+        mkdir -p "$prefix"
+        printf 'claude-launcher: installing %s into %s (no sudo) ...\n' "$(npm_pkg)" "$prefix" >&2
+        npm install -g --prefix "$prefix" "$(npm_pkg)" || { printf 'claude-launcher: npm install failed\n' >&2; return 1; }
+        binpath="$prefix/bin/claude"
+        case ":$PATH:" in
+            *":$prefix/bin:"*) ;;
+            *) printf 'claude-launcher: add %s/bin to your PATH (ahead of other claude installs)\n' "$prefix" >&2 ;;
+        esac
+    else
+        prefix=$(npm prefix -g 2>/dev/null)
+        printf 'claude-launcher: installing %s into %s (may prompt for sudo) ...\n' "$(npm_pkg)" "$prefix" >&2
+        if [[ -w $prefix/lib || -w $prefix ]]; then
+            npm install -g "$(npm_pkg)" || return 1
+        else
+            command -v sudo >/dev/null 2>&1 || { printf 'claude-launcher: %s not writable and no sudo available\n' "$prefix" >&2; return 1; }
+            sudo npm install -g "$(npm_pkg)" || return 1
+        fi
+        binpath="$prefix/bin/claude"
+    fi
+    [[ -x $binpath ]] || { printf 'claude-launcher: npm install did not produce %s\n' "$binpath" >&2; return 1; }
+    config_set claude_channel npm
+    config_set claude_version ""
+    config_set claude_bin "$binpath"
+    return 0
+}
+
+installed_builds_line() {
+    # One-line summary of what is installed and which one is active.
+    local active native_latest npm_user npm_sys line=""
+    active=$(find_real_claude || true)
+    native_latest=$(latest_native)
+    [[ -n $native_latest ]] && line+="native $(basename "$native_latest")"
+    npm_user="$HOME/.npm-global/bin/claude"
+    [[ -x $npm_user ]] && line+="${line:+ · }npm(user)"
+    npm_sys="$(npm prefix -g 2>/dev/null)/bin/claude"
+    [[ -n $npm_sys && -x $npm_sys ]] && line+="${line:+ · }npm(system)"
+    [[ -n $active ]] && line+="${line:+ · }active: $active"
+    printf '%s' "${line:-none installed}"
+}
+
+install_menu() {
+    # Interactive build chooser. $1 == bootstrap when called because no
+    # binary was found (offers install only). Uses a plain numbered prompt
+    # (works in the bootstrap/no-TUI path); returns 0 on success.
+    local mode=${1:-manage} choice target scope
+    printf '\nClaude Code build\n' >&2
+    printf '  installed: %s\n' "$(installed_builds_line)" >&2
+    printf '\n' >&2
+    printf '  1) native - install latest (curl claude.ai/install.sh; ~/.local, self-updating)\n' >&2
+    printf '  2) native - install a specific/older version (e.g. 2.1.220)\n' >&2
+    printf '  3) npm - user install, no sudo (~/.npm-global, updates in place)\n' >&2
+    printf '  4) npm - system install (npm -g, may need sudo)\n' >&2
+    [[ $mode != bootstrap ]] && printf '  5) switch active build (native <-> npm) without reinstalling\n' >&2
+    printf '  q) cancel\n\n' >&2
+    printf 'choice: ' >&2
+    IFS= read -r choice || return 1
+    case $choice in
+        1) install_native latest ;;
+        2) printf 'version (e.g. 2.1.220, or stable): ' >&2; IFS= read -r target || return 1
+           [[ -n $target ]] || return 1
+           install_native "$target" ;;
+        3) install_npm user ;;
+        4) install_npm system ;;
+        5) [[ $mode == bootstrap ]] && return 1
+           switch_build ;;
+        *) return 1 ;;
+    esac
+}
+
+switch_build() {
+    # Repoint claude_bin at an already-installed build without reinstalling.
+    local native npm_user npm_sys
+    native=$(latest_native)
+    npm_user="$HOME/.npm-global/bin/claude"
+    npm_sys="$(npm prefix -g 2>/dev/null)/bin/claude"
+    printf '\nswitch active build:\n' >&2
+    [[ -n $native ]]   && printf '  1) native  %s\n' "$native" >&2
+    [[ -x $npm_user ]] && printf '  2) npm user   %s\n' "$npm_user" >&2
+    [[ -n $npm_sys && -x $npm_sys ]] && printf '  3) npm system %s\n' "$npm_sys" >&2
+    printf '  q) cancel\n\nchoice: ' >&2
+    local c; IFS= read -r c || return 1
+    case $c in
+        1) [[ -n $native ]] || return 1
+           config_set claude_channel native; config_set claude_bin ""; config_set claude_version "" ;;
+        2) [[ -x $npm_user ]] || return 1
+           config_set claude_channel npm; config_set claude_bin "$npm_user"; config_set claude_version "" ;;
+        3) [[ -n $npm_sys && -x $npm_sys ]] || return 1
+           config_set claude_channel npm; config_set claude_bin "$npm_sys"; config_set claude_version "" ;;
+        *) return 1 ;;
+    esac
+    printf 'claude-launcher: active build -> %s\n' "$(find_real_claude || echo '?')" >&2
+}
+
 # ----------------------------------------------------------------- menu
 
 toggle() {
@@ -2495,10 +2732,26 @@ seed_files
 load_config
 load_state
 
-CLAUDE_BIN=${claude_bin:-$(type -P claude || true)}
-[[ -n $CLAUDE_BIN ]] || die "no claude binary found in PATH; set claude_bin in $CONFIG_FILE"
-if [[ $(readlink -f "$CLAUDE_BIN") == $(readlink -f "$0") ]]; then
-    die "claude in PATH resolves to this launcher; set claude_bin in $CONFIG_FILE"
+# `claude install` shows the launcher's build chooser (native vs npm,
+# specific/older versions, switch active build). Handled before binary
+# discovery so it works even with nothing installed yet. This shadows
+# Claude Code's own `claude install`, whose full range (stable / latest /
+# any version) is available from inside the chooser.
+if [[ ${1:-} == install ]]; then
+    install_menu manage
+    exit $?
+fi
+
+CLAUDE_BIN=$(find_real_claude || true)
+if [[ -z $CLAUDE_BIN ]]; then
+    # No real Claude Code found (only launcher[s], or nothing). Offer to
+    # install one rather than dying, since the launcher may now BE `claude`.
+    if [[ -t 0 && -t 1 && ${CLAUDE_LAUNCHER_DRY_RUN:-0} != 1 ]]; then
+        printf 'claude-launcher: no Claude Code binary found.\n' >&2
+        install_menu bootstrap
+        CLAUDE_BIN=$(find_real_claude || true)
+    fi
+    [[ -n $CLAUDE_BIN ]] || die "no Claude Code binary found. Run 'claude install', or set claude_bin in $CONFIG_FILE (install: https://claude.ai/install.sh, or npm i -g @anthropic-ai/claude-code)"
 fi
 
 provider=$(state_get provider anthropic)

@@ -12,6 +12,11 @@ statusline.sh
 *.conf.old
 *.conf.bak-*
 
+# rpm build artifacts (spec is tracked; built packages are not)
+*.rpm
+*.srpm
+/rpmbuild/
+
 # editor / OS noise
 *.swp
 *~
