@@ -55,3 +55,8 @@ added, trigger rebuilds manually with `copr-cli build-package` above.
 
 fedora-43, fedora-44, fedora-rawhide (x86_64 and aarch64). The package is
 `noarch`, so one build serves every arch per release.
+
+## Auto-rebuild status
+
+The GitHub push webhook is configured and active (COPR project 250933).
+Pushes to `main` trigger a COPR rebuild automatically.
