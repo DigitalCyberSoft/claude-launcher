@@ -1,5 +1,5 @@
 Name:           claude-launcher
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Menu front-end that becomes the primary `claude`, wrapping Claude Code
 
@@ -38,10 +38,10 @@ versions. Switching a build only repoints the launcher's config; it never
 touches ~/.claude (settings, sessions, credentials) or the launcher's own
 configuration under ~/.config/claude-launcher.
 
-Providers beyond Anthropic (Moonshot/Kimi, DeepSeek, Qwen, OpenAI, Grok)
-are supported by routing the same binary through the appropriate endpoint
-or a per-session LiteLLM proxy. A global bash completion for `claude` is
-installed as well.
+Providers beyond Anthropic (Moonshot/Kimi, DeepSeek, Qwen, OpenAI, Grok,
+OpenRouter) are supported by routing the same binary through the
+appropriate endpoint or a per-session LiteLLM proxy. A global bash
+completion for `claude` is installed as well.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -62,6 +62,15 @@ install -D -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 %license %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Fri Aug 21 2026 DigitalCyberSoft <claude@dcs.io> - 0.2.0-1
+- Add OpenRouter provider over its native Anthropic-compatible "skin"
+  (direct endpoint, no proxy); pins ANTHROPIC_API_KEY empty so an
+  Anthropic key cannot leak to a third-party host
+- Seed stealth/ox-alpha and auto-surface cloaked "stealth/*" models as
+  new models via the /api/v1/models catalog refresh
+- write_efforts_map reads OpenRouter reasoning.supported_efforts, so
+  per-model effort levels are honored (ox-alpha: low/high/max only)
+
 * Wed Aug 05 2026 DigitalCyberSoft <claude@dcs.io> - 0.1.0-1
 - Initial package: installs the launcher as /usr/bin/claude (primary
   `claude`), wrapping and discovering the real Claude Code build

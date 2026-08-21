@@ -495,6 +495,72 @@ provider_info() {
 }
 EOF
 
+    [[ -e $PROVIDER_DIR/openrouter.conf ]] || cat >"$PROVIDER_DIR/openrouter.conf" <<'EOF'
+# OpenRouter (model gateway) over its native Anthropic-compatible "skin":
+# base .../api, Claude Code posts to /api/v1/messages, the same no-proxy
+# shape as DeepSeek/Qwen. Endpoint, Bearer auth, and the stealth/ox-alpha
+# id were verified live 2026-08-21 against openrouter.ai/api/v1/messages (a
+# native Anthropic Messages reply came back: thinking + text, provider
+# "Stealth", cost 0). Uses OPENROUTER_API_KEY from ~/.bashrc. Model ids are
+# vendor/model (stealth/ox-alpha, anthropic/claude-sonnet-5, openrouter/
+# auto); the skin maps them and the id is sent unchanged.
+name="OpenRouter"
+base_url="https://openrouter.ai/api"
+auth_token_env="OPENROUTER_API_KEY"
+# Bearer token (verified), the ANTHROPIC_AUTH_TOKEN default. OpenRouter's
+# own Claude Code guide additionally requires ANTHROPIC_API_KEY to be an
+# EMPTY STRING, not merely unset, so CC never falls back to a real Anthropic
+# key on a third-party host. run_claude already `env -u`s it; extra_env sets
+# it back to "" on top (verified: `env -u X ... X=` yields empty-but-present).
+auth_var="ANTHROPIC_AUTH_TOKEN"
+extra_env=("ANTHROPIC_API_KEY=")
+# 1M-context models get [1m] automatically. context/output/effort are
+# DISCOVERED from /api/v1/models (it carries context_length, pricing, and
+# reasoning metadata; see write_context_map / write_efforts_map). The maps
+# below are only pre-refresh fallbacks for the seeded ids.
+auto_1m=1
+# stealth/ox-alpha: 1048576 window (live record 2026-08-21).
+context_map="
+stealth/ox-alpha 1048576
+"
+# Provider-wide output ceiling. 131072 = ox-alpha's max_completion_tokens,
+# at or above the flagship models' caps; OpenRouter normalizes an oversized
+# max_tokens down to the model's real limit rather than 400ing.
+max_output_tokens=131072
+# Per-model effort is discovered from the listing's reasoning.supported_efforts
+# and cached; efforts=detect emits ONLY the levels a model accepts. Example:
+# stealth/ox-alpha takes low/high/max ONLY (reasoning mandatory, default max)
+# and would 400 on medium/xhigh. The default effort (max) is valid for it, so
+# it is correct even before the first refresh populates the effort cache.
+efforts="detect"
+# Discovery: the public catalog (Bearer tolerated). models_filter tames the
+# ~400-entry catalog: the seeded ids always show, and any stealth/* model
+# (the cloaked eval drops, like ox-alpha) auto-surfaces as a "new model" on
+# the daily refresh. That is the "way to find it"; widen the filter to make
+# more of the catalog pickable from the menu.
+models_url="https://openrouter.ai/api/v1/models"
+models_auth_env="OPENROUTER_API_KEY"
+models_filter="^stealth/"
+models=(
+    "stealth/ox-alpha"
+    "openrouter/auto"
+    "anthropic/claude-sonnet-5"
+    "google/gemini-3.7-flash"
+)
+# Remaining credit / usage on the key (GET /api/v1/key, verified live).
+provider_info() {
+    local key="${!auth_token_env-}"
+    [[ -n $key ]] || { printf 'OPENROUTER_API_KEY unset'; return 0; }
+    curl -sf --max-time 6 https://openrouter.ai/api/v1/key \
+        -H "authorization: Bearer $key" 2>/dev/null \
+        | jq -r 'if .data then
+              (if .data.limit_remaining != null then "credits left \(.data.limit_remaining)"
+               elif .data.limit != null then "credits left \(.data.limit - (.data.usage // 0))"
+               else "unmetered · usage \(.data.usage // 0)" end)
+            else "key check failed" end' 2>/dev/null
+}
+EOF
+
     [[ -e $CL_HOME/litellm.yaml ]] || cat >"$CL_HOME/litellm.yaml" <<'EOF'
 # REFERENCE ONLY. The launcher no longer uses this file at run time: for
 # openai and grok it generates a fresh per-session config from the active
@@ -865,7 +931,8 @@ write_efforts_map() {
     # stdin: models JSON. Cache "id low,medium,..." per model from the
     # listing's effort metadata; "id -" for models without effort support.
     # Anthropic-style: capabilities.effort flags. Moonshot-style:
-    # reasoning_efforts.valid_efforts.
+    # reasoning_efforts.valid_efforts. OpenRouter-style:
+    # reasoning.supported_efforts.
     command -v jq >/dev/null 2>&1 || return 0
     jq -r '.data[] | .id as $id
         | if .capabilities != null then
@@ -880,6 +947,9 @@ write_efforts_map() {
                 and (.reasoning_efforts.valid_efforts | type == "array")) then
                 "\($id) " + (.reasoning_efforts.valid_efforts | join(","))
             else "\($id) -" end
+          elif (.reasoning != null
+                and (.reasoning.supported_efforts | type) == "array") then
+            "\($id) " + (.reasoning.supported_efforts | join(","))
           else "\($id) -" end' \
         2>/dev/null >"$CACHE_DIR/efforts__$provider"
     return 0
