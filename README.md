@@ -227,8 +227,8 @@ Claude Code's own `/model` menu (opened inside a session) is built from a fixed 
 
 ```
 tier_map="
-opus  deepseek-v4-pro   | DeepSeek V4 Pro   | DeepSeek V4 Pro · 1M context
-haiku deepseek-v4-flash | DeepSeek V4 Flash | DeepSeek V4 Flash · fast, cheap
+opus  deepseek-v4-pro | DeepSeek V4 Pro     | DeepSeek V4 Pro · 1M context
+haiku deepseek-flash  | DeepSeek V4.1 Flash | DeepSeek V4.1 Flash · fast, cheap
 "
 ```
 

@@ -1,5 +1,5 @@
 Name:           claude-launcher
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Menu front-end that becomes the primary `claude`, wrapping Claude Code
 
@@ -62,6 +62,22 @@ install -D -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 %license %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Thu Sep 10 2026 DigitalCyberSoft <claude@dcs.io> - 0.3.0-1
+- DeepSeek: follow the flash rename to `deepseek-flash` (DeepSeek-V4.1-
+  Flash, which also carries vision); the retired `deepseek-v4-flash` alias
+  is kept in context_map so state that still remembers it keeps working
+- DeepSeek's K is 1024, not 1000: their API reference bounds max_tokens at
+  "between 1 and 384K (393216)", so the output cap is 393216 (was 384000)
+  and 1M context is 1048576 (was 1000000)
+- Fix a model with no context_map entry getting NO context pin at all:
+  selecting the newly-named deepseek-flash left Claude Code on its 200000
+  fallback with no [1m] suffix. The picker discovers new model ids
+  automatically, but their limits are declared per model
+- Wire the xhigh effort level. `ultra` is accepted by DeepSeek's endpoint
+  but rejected by Claude Code, which silently falls back to the default
+  effort, so it is deliberately left out
+- completions/README: track the renamed DeepSeek id
+
 * Fri Aug 21 2026 DigitalCyberSoft <claude@dcs.io> - 0.2.0-1
 - Add OpenRouter provider over its native Anthropic-compatible "skin"
   (direct endpoint, no proxy); pins ANTHROPIC_API_KEY empty so an

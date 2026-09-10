@@ -394,36 +394,54 @@ auth_token_env="DEEPSEEK_API_KEY"
 # (verified 2026-08-02), which is the ANTHROPIC_AUTH_TOKEN default.
 auth_var="ANTHROPIC_AUTH_TOKEN"
 # Map both models onto Claude Code's /model tiers so they BOTH show in the
-# native /model menu, each named properly (not "deepseek-v4-flash / Custom
+# native /model menu, each named properly (not "deepseek-flash / Custom
 # Haiku model"). Format: <tier> <id> | <menu label> | <description>.
 # haiku also serves as the background/haiku-class model, so this replaces
 # default_haiku_model. Tiers cap at opus/sonnet/haiku/fable.
+# V4 Pro is being retired: from 12:00 Beijing on 2026-09-14 the
+# deepseek-v4-pro id routes to V4.1 Flash at Flash pricing, then back to a
+# real Pro once V4.1 Pro ships (pricing page, read 2026-09-10). The mapping
+# stays on purpose -- the id is the rolling pointer to the next Pro.
 tier_map="
 opus deepseek-v4-pro | DeepSeek V4 Pro | DeepSeek V4 Pro · 1M context, strongest
-haiku deepseek-v4-flash | DeepSeek V4 Flash | DeepSeek V4 Flash · fast, cheap
+haiku deepseek-flash | DeepSeek V4.1 Flash | DeepSeek V4.1 Flash · fast, cheap, vision
 "
-# Both models are 1M context (official table 2026-08-02), so append [1m].
+# Both models are 1M context, so append [1m].
 auto_1m=1
-# /models carries no context metadata (id/object/owned_by only, checked
-# 2026-08-02); declare per model. Both are 1M.
+# /models carries no context metadata (id/object/owned_by only, rechecked
+# 2026-09-10); declare per model. 1M is 1048576, NOT 1000000: DeepSeek's K
+# is 1024, which their own API reference proves by writing the output cap
+# as "384K (393216)". deepseek-v4-flash is the retired alias for
+# deepseek-flash, kept so a session that already remembers the old id
+# still gets its window.
 context_map="
-deepseek-v4-flash 1000000
-deepseek-v4-pro 1000000
+deepseek-flash 1048576
+deepseek-v4-flash 1048576
+deepseek-v4-pro 1048576
 "
-# MAX OUTPUT 384K for both (official table); well above CC's 128K default.
-max_output_tokens=384000
-# The Anthropic endpoint ACCEPTS output_config.effort at low/medium/high/
-# max (probed 2026-08-02), but DeepSeek documents thinking as an on/off
-# mode, not a graded scale, and low-vs-max barely changed output depth in
-# testing (574 vs 625 tokens on the same prompt). Levels are wired because
-# they are accepted and harmless; they may not actually grade reasoning.
-efforts="low medium high max"
+# Output cap. DeepSeek's API reference bounds max_tokens at "between 1 and
+# 384K (393216)" -- so 384K is 393216, not 384000 (read 2026-09-10). Above
+# CC's own 128K ceiling, so this is the model's real cap.
+max_output_tokens=393216
+# The Anthropic endpoint accepts output_config.effort at low/medium/high/
+# xhigh/ultra/max (probed 2026-09-10: the API names that full set in its
+# own rejection message), but Claude Code validates --effort to
+# low/medium/high/xhigh/max and silently falls back to the DEFAULT effort
+# on anything else (2.1.267). So "ultra" is deliberately NOT wired -- it
+# would appear in the menu and do nothing. xhigh IS wired; both accept it.
+# DeepSeek documents thinking as an on/off mode, not a graded scale, and
+# low-vs-max barely changed output depth in testing (574 vs 625 tokens on
+# the same prompt). Levels are wired because they are accepted and
+# harmless; they may not actually grade reasoning.
+efforts="low medium high xhigh max"
 # /models is OpenAI-shape (.data[].id); discovery works with the default
-# header set (verified 2026-08-02).
+# header set (verified 2026-08-02; 2026-09-10 it lists deepseek-flash and
+# deepseek-v4-pro and nothing else -- deepseek-v4-flash has left the
+# catalog, though the id itself still resolves).
 models_url="https://api.deepseek.com/models"
 models=(
     "deepseek-v4-pro"
-    "deepseek-v4-flash"
+    "deepseek-flash"
 )
 # Account balance (documented endpoint, verified 2026-08-02).
 provider_info() {
