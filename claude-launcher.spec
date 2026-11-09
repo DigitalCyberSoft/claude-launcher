@@ -1,5 +1,5 @@
 Name:           claude-launcher
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Menu front-end that becomes the primary `claude`, wrapping Claude Code
 
@@ -62,6 +62,21 @@ install -D -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 %license %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Mon Nov 09 2026 DigitalCyberSoft <claude@dcs.io> - 0.4.0-1
+- Drop the claude.ai-only Artifact tool family (--disallowedTools) on every
+  third-party launch: it cannot work without the claude.ai connector, and
+  DeepSeek 400s the whole request over its schema pattern. New per-conf
+  disallowed_tools field for tools a specific endpoint rejects
+- Models: claude-opus-5-5 (new default), claude-fable-5-1,
+  claude-sonnet-5-5, claude-haiku-5-5; kimi-k3.1-pro(+highspeed);
+  qwen3.8-flash; gpt-6-astra, gpt-6.1-sol/terra, gpt-6-sol/luna,
+  gpt-5.6-terra/luna; grok-4.7, grok-4.6; OpenRouter stealth/crouton-alpha
+  (ox-alpha retired), claude-opus-5.5, gpt-6-astra, gemini-4-argon
+- OpenAI context pinned to the 922000-token input maximum, not the 1.05M
+  window that includes output, so long sessions stay within limits
+- Moonshot gains a context_map fallback so a model newer than the cached
+  listing no longer falls back to Claude Code's 200K default
+
 * Thu Sep 10 2026 DigitalCyberSoft <claude@dcs.io> - 0.3.0-1
 - DeepSeek: follow the flash rename to `deepseek-flash` (DeepSeek-V4.1-
   Flash, which also carries vision); the retired `deepseek-v4-flash` alias

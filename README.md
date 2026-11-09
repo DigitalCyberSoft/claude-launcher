@@ -10,7 +10,7 @@ Run `claude` with no arguments and you get a menu. Run it with arguments and it 
   Resume          fix flaky pty test              (yesterday)
   ──────────────────────────────────────────────────────────
   provider    [anthropic] · grok · moonshot · openai
-  model       claude-opus-4-8[1m]
+  model       claude-opus-5-5[1m]
   effort      max
   hooks       on · PreToolUse, SessionStart, statusline, 2 plugins
   ...
@@ -113,7 +113,7 @@ Over a pipe or a dumb terminal it falls back to a plain line menu with the same 
 [q] quit
 ```
 
-Your provider, model, effort, subagent model, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-4-8[1m]`, effort `max`, subagent `inherit`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
+Your provider, model, effort, subagent model, toggles, and per-model disables persist in `~/.config/claude-launcher/state`. Out of the box the defaults are Anthropic, `claude-opus-5-5[1m]`, effort `max`, subagent `inherit`, hooks on, system prompt off, no-CLAUDE.md off, safe mode off.
 
 **Settings are remembered per directory.** The session-shaping choices — provider and, under it, model / effort / subagent / system prompt / hooks / no-CLAUDE.md / safe mode — are stored per working directory, so one project can default to Grok while another defaults to Opus, and each restores its own setup when you `cd` back. A directory you open for the first time inherits your current (last-used) values, then diverges as you change things there. Per-model disable lists stay global. Existing flat state keeps working unchanged.
 
@@ -188,6 +188,12 @@ These are two different limits, and the launcher sets them independently.
 Where the numbers come from: Anthropic listings carry `max_input_tokens` and Moonshot's carry `context_length`, both cached at refresh. OpenAI's and xAI's listings carry neither, so their confs declare each model's window in a `context_map` taken from vendor docs.
 
 ---
+
+## Tool compatibility on third-party providers
+
+Claude Code disables its claude.ai connectors whenever an auth token is set, so the **Artifact** tool family (`Artifact`, `ArtifactComments`, `ArtifactData`, `ArtifactCheck`) cannot function on any non-Anthropic endpoint. Beyond being dead weight, it actively breaks some providers: DeepSeek's endpoint validates tool JSON-Schemas strictly and rejects the whole request with `400 Invalid schema for function 'Artifact': "^[^\0]*$" is not a "regex"`, because the Artifact schema carries a pattern DeepSeek's regex validator won't accept. (Moonshot and xAI happen to accept the schema, but the tools still can't run there.)
+
+So on every third-party launch the launcher drops that family from the wire with `--disallowedTools`. Native Anthropic is untouched — there the connector works and Artifacts are useful. If a specific endpoint rejects some *other* tool, add its name to that conf's `disallowed_tools` field (a space- or comma-separated list); it is merged with the Artifact family and with any `--disallowedTools` you pass yourself.
 
 ## Selective hooks
 

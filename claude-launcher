@@ -57,6 +57,15 @@ PROVIDER_DIR="$CL_HOME/providers"
 CACHE_DIR="$CL_HOME/cache"
 
 EFFORTS=(low medium high xhigh max)
+# Tools that only work through the claude.ai login (the Artifact family):
+# Claude Code disables its claude.ai connectors whenever ANTHROPIC_AUTH_TOKEN
+# is set, so on ANY third-party endpoint these tools cannot function. Worse,
+# a strict server-side schema validator rejects the whole request over them:
+# DeepSeek's /anthropic endpoint 400s with `"^[^\0]*$" is not a "regex"` on
+# the Artifact tool's pattern (verified 2026-09-23; Moonshot and xAI accept
+# it, but the tools still can't run there). They are dropped from the wire
+# with --disallowedTools on every third-party launch (see run_claude).
+ARTIFACT_TOOLS="Artifact ArtifactComments ArtifactData ArtifactCheck"
 # Subcommands from `claude --help` (2.1.220): never decorated.
 SUBCOMMANDS=(agents auth auto-mode doctor gateway install mcp plugin plugins
              project setup-token ultrareview update upgrade)
@@ -180,10 +189,14 @@ efforts="detect"
 # for current claude models; Claude Code clamps to each model's limit).
 max_output_tokens=128000
 models=(
-    "claude-opus-4-8[1m]"
-    "claude-fable-5[1m]"
+    "claude-opus-5-5[1m]"
+    "claude-fable-5-1[1m]"
+    "claude-sonnet-5-5[1m]"
     "claude-opus-5"
     "claude-sonnet-5"
+    "claude-fable-5[1m]"
+    "claude-opus-4-8[1m]"
+    "claude-haiku-5-5[1m]"
     "claude-haiku-4-5"
 )
 # Subscription usage: same unofficial OAuth endpoint the statusline
@@ -238,11 +251,25 @@ auto_1m=1
 # Claude Code defaults unknown models to max_tokens 32000; 128000 is its
 # ceiling for unlisted models (wire-verified 2026-08-02).
 max_output_tokens=128000
+# Pre-refresh fallback only: the live listing's context_length wins once
+# cached. Without it, a model newer than the cache (kimi-k3.1-pro, added
+# 2026-11-09) got NO context pin and Claude Code sat at its 200K default.
+# Figures from GET /v1/models, 2026-11-09.
+context_map="
+kimi-k3.1-pro 1048576
+kimi-k3.1-pro-highspeed 1048576
+kimi-k3 1048576
+kimi-k2.7-code 262144
+kimi-k2.7-code-highspeed 262144
+kimi-k2.6 262144
+"
 # No models route on the /anthropic path (404, checked 2026-08-01);
 # the OpenAI-compatible route serves the same account's model list.
 models_url="https://api.moonshot.ai/v1/models"
 # List below verified live against /v1/models on 2026-08-01.
 models=(
+    "kimi-k3.1-pro"
+    "kimi-k3.1-pro-highspeed"
     "kimi-k3"
     "kimi-k2.7-code"
     "kimi-k2.7-code-highspeed"
@@ -282,10 +309,23 @@ auth_var="ANTHROPIC_AUTH_TOKEN"
 # owned_by only, checked 2026-08-02), so context is declared per model
 # here rather than discovered. context_map drives auto [1m] and the
 # CLAUDE_CODE_MAX_CONTEXT_TOKENS override. Numbers from
-# developers.openai.com model pages, 2026-08-02.
+# developers.openai.com model pages, 2026-08-02; GPT-6 family 2026-09-29;
+# refreshed 2026-11-09. The docs' "1.05M context window" INCLUDES the 128K
+# output: each page also states "Maximum input tokens: 922,000" (1,050,000
+# - 128,000). Claude Code's window is the INPUT budget, so declaring 1.05M
+# would let a long session grow past what OpenAI accepts. 922000 is < 1M,
+# so these get no [1m] suffix; CLAUDE_CODE_MAX_CONTEXT_TOKENS carries the
+# real window either way.
 auto_1m=1
 context_map="
-gpt-5.6-sol 1050000
+gpt-6-astra 922000
+gpt-6.1-sol 922000
+gpt-6.1-terra 922000
+gpt-6-sol 922000
+gpt-6-luna 922000
+gpt-5.6-sol 922000
+gpt-5.6-terra 922000
+gpt-5.6-luna 922000
 gpt-5.3-codex 272000
 "
 # Reasoning effort reaches OpenAI as reasoning_effort IF the LiteLLM
@@ -294,11 +334,24 @@ gpt-5.3-codex 272000
 # sol takes up to max; codex rejects "max" and "minimal" with a 400.
 # efforts="map" emits ONLY listed values (no --effort for absent models).
 efforts="map"
+# Re-probed 2026-11-09 against the Responses API (the path LiteLLM uses for
+# OpenAI): every model below accepts max EXCEPT gpt-5.3-codex. Chat
+# Completions rejects max on all of them, so a LiteLLM that routes OpenAI
+# through chat completions would 400 on max -- keep LiteLLM current.
 efforts_map="
+gpt-6-astra low,medium,high,xhigh,max
+gpt-6.1-sol low,medium,high,xhigh,max
+gpt-6.1-terra low,medium,high,xhigh,max
+gpt-6-sol low,medium,high,xhigh,max
+gpt-6-luna low,medium,high,xhigh,max
 gpt-5.6-sol low,medium,high,xhigh,max
+gpt-5.6-terra low,medium,high,xhigh,max
+gpt-5.6-luna low,medium,high,xhigh,max
 gpt-5.3-codex low,medium,high,xhigh
 "
-# max_tokens ceiling 128000 for both (developers.openai.com, 2026-08-02).
+# max_tokens ceiling 128000 for every listed model (developers.openai.com,
+# 2026-08-02; GPT-6 astra/sol/luna 2026-09-29; 6.1 + 5.6 terra/luna
+# 2026-11-09).
 max_output_tokens=128000
 # Discovery hits OpenAI directly (the per-session proxy is not running at
 # menu time). The vendor listing tolerates the launcher's header set.
@@ -306,7 +359,14 @@ models_url="https://api.openai.com/v1/models"
 models_auth_env="OPENAI_API_KEY"
 models_filter="^(gpt|o[0-9])"
 models=(
+    "gpt-6-astra"
+    "gpt-6.1-sol"
+    "gpt-6.1-terra"
+    "gpt-6-luna"
+    "gpt-6-sol"
     "gpt-5.6-sol"
+    "gpt-5.6-terra"
+    "gpt-5.6-luna"
     "gpt-5.3-codex"
 )
 # OpenAI exposes no balance to normal API keys (credit_grants needs a
@@ -341,6 +401,8 @@ auth_var="ANTHROPIC_AUTH_TOKEN"
 # (grok-4.3 is the 1M-context model; grok-4.5 500K; grok-build-0.1 256K).
 auto_1m=1
 context_map="
+grok-4.7 500000
+grok-4.6 500000
 grok-4.5 500000
 grok-4.3 1000000
 grok-build-0.1 256000
@@ -352,6 +414,8 @@ grok-build-0.1 256000
 # entirely (absent from the map -> no --effort).
 efforts="map"
 efforts_map="
+grok-4.7 low,medium,high,xhigh
+grok-4.6 low,medium,high,xhigh
 grok-4.5 low,medium,high,xhigh
 grok-4.3 low,medium,high,xhigh
 "
@@ -364,6 +428,8 @@ models_url="https://api.x.ai/v1/models"
 models_auth_env="XAI_API_KEY"
 models_filter="^grok"
 models=(
+    "grok-4.7"
+    "grok-4.6"
     "grok-4.5"
     "grok-build-0.1"
     "grok-4.3"
@@ -475,6 +541,7 @@ auto_1m=1
 # 2026-08-03 accepted ~300K-token inputs without complaint.
 context_map="
 qwen3.8-max 1000000
+qwen3.8-flash 1000000
 qwen3.7-max 1000000
 qwen3.7-plus 1000000
 "
@@ -492,9 +559,10 @@ efforts=""
 # entries (image/omni/vl/audio excluded).
 models_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1/models"
 models_auth_env="DASHSCOPE_API_KEY"
-models_filter="^qwen[0-9.]*-(max|plus)(-[0-9]|$)"
+models_filter="^qwen[0-9.]*-(max|plus|flash)(-[0-9]|$)"
 models=(
     "qwen3.8-max"
+    "qwen3.8-flash"
     "qwen3.7-max"
     "qwen3.7-plus"
 )
@@ -539,7 +607,7 @@ extra_env=("ANTHROPIC_API_KEY=")
 auto_1m=1
 # stealth/ox-alpha: 1048576 window (live record 2026-08-21).
 context_map="
-stealth/ox-alpha 1048576
+stealth/crouton-alpha 1048576
 "
 # Provider-wide output ceiling. 131072 = ox-alpha's max_completion_tokens,
 # at or above the flagship models' caps; OpenRouter normalizes an oversized
@@ -560,10 +628,11 @@ models_url="https://openrouter.ai/api/v1/models"
 models_auth_env="OPENROUTER_API_KEY"
 models_filter="^stealth/"
 models=(
-    "stealth/ox-alpha"
+    "stealth/crouton-alpha"
     "openrouter/auto"
-    "anthropic/claude-sonnet-5"
-    "google/gemini-3.7-flash"
+    "anthropic/claude-opus-5.5"
+    "openai/gpt-6-astra"
+    "google/gemini-4-argon"
 )
 # Remaining credit / usage on the key (GET /api/v1/key, verified live).
 provider_info() {
@@ -600,6 +669,26 @@ EOF
 # launcher's per-model effort menus are correct regardless; this only
 # governs whether the chosen level actually reaches the model.
 model_list:
+  - model_name: gpt-6-astra
+    litellm_params:
+      model: openai/gpt-6-astra
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-6.1-sol
+    litellm_params:
+      model: openai/gpt-6.1-sol
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-6.1-terra
+    litellm_params:
+      model: openai/gpt-6.1-terra
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-6-sol
+    litellm_params:
+      model: openai/gpt-6-sol
+      api_key: os.environ/OPENAI_API_KEY
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: openai/gpt-6-luna
+      api_key: os.environ/OPENAI_API_KEY
   - model_name: gpt-5.6-sol
     litellm_params:
       model: openai/gpt-5.6-sol
@@ -608,6 +697,14 @@ model_list:
     litellm_params:
       model: openai/gpt-5.3-codex
       api_key: os.environ/OPENAI_API_KEY
+  - model_name: grok-4.7
+    litellm_params:
+      model: xai/grok-4.7
+      api_key: os.environ/XAI_API_KEY
+  - model_name: grok-4.6
+    litellm_params:
+      model: xai/grok-4.6
+      api_key: os.environ/XAI_API_KEY
   - model_name: grok-4.5
     litellm_params:
       model: xai/grok-4.5
@@ -644,6 +741,12 @@ models_filter=""                   # regex keeping only matching discovered ids
 # max_output_tokens=128000         # raise CC's 32000 unknown-model default
 models=("model-a" "model-b")
 # extra_env=("FOO=bar")            # extra environment for claude
+# disallowed_tools=""              # extra tool names to drop via
+#                                  # --disallowedTools (space/comma list).
+#                                  # The claude.ai-only Artifact family is
+#                                  # ALREADY dropped on every third-party
+#                                  # endpoint; use this only for a tool your
+#                                  # specific endpoint additionally rejects.
 # Optional: one line of account data for the menu (cached 24h).
 # provider_info() { curl -sf --max-time 6 ... | jq -r '...'; }
 EOF
@@ -853,7 +956,7 @@ normalize_ws() {
 name="" base_url="" auth_token_env="" auth_var="" default_haiku_model=""
 auth_optional=0 preflight_hint="" models_url="" models_auth_env="" auto_1m=0
 max_output_tokens="" efforts_map="" context_map="" tier_map=""
-managed_proxy=0 proxy_route="" proxy_key_env=""
+managed_proxy=0 proxy_route="" proxy_key_env="" disallowed_tools=""
 models=() extra_env=()
 
 load_provider() {
@@ -862,7 +965,7 @@ load_provider() {
     default_haiku_model="" auth_optional=0 preflight_hint=""
     models_url="" models_auth_env="" auto_1m=0 efforts="" models_filter=""
     max_output_tokens="" efforts_map="" context_map="" tier_map=""
-    managed_proxy=0 proxy_route="" proxy_key_env=""
+    managed_proxy=0 proxy_route="" proxy_key_env="" disallowed_tools=""
     models=() extra_env=()
     unset -f provider_info 2>/dev/null
     [[ -r $PROVIDER_DIR/$id.conf ]] || die "no provider '$id' ($PROVIDER_DIR/$id.conf)"
@@ -1777,6 +1880,19 @@ run_claude() {
     # $@ = claude args. Uses LAUNCH_ENV / TUNE_ENV / base_url set by caller.
     local -a skip_env=()
     mapfile -t skip_env < <(hook_skip_env)
+
+    # Drop tools the endpoint can't serve. Third-party endpoints (base_url
+    # set -- including a managed proxy) get the claude.ai-only Artifact
+    # family removed: it can't work without the connector, and DeepSeek even
+    # 400s the whole request over its schema. Any per-conf disallowed_tools
+    # is merged in. Levels accumulate with a user-supplied --disallowedTools
+    # (they combine), and unknown names are harmless. Prepended so it shows
+    # in the dry-run and reaches every launch branch below.
+    local deny=""
+    [[ -n $base_url ]] && deny=$ARTIFACT_TOOLS
+    [[ -n ${disallowed_tools:-} ]] && deny="${deny:+$deny }$disallowed_tools"
+    [[ -n $deny ]] && set -- --disallowedTools "$deny" "$@"
+
     if [[ ${CLAUDE_LAUNCHER_DRY_RUN:-0} == 1 ]]; then
         local out="env" e a
         ((managed_proxy)) && out="[managed proxy: $proxy_route on an ephemeral port] $out"
@@ -2854,7 +2970,7 @@ load_provider "$provider"
 [[ -e $STATE_FILE ]] || {
     STATE[provider]=$provider
     STATE[effort]=max
-    STATE[model__anthropic]="claude-opus-4-8[1m]"
+    STATE[model__anthropic]="claude-opus-5-5[1m]"
     save_state
 }
 

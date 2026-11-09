@@ -33,13 +33,16 @@ _claude_subcommands='agents auth auto-mode doctor gateway import install mcp plu
 # the 1M-context ids. Extend as providers are added.
 _claude_models='
 sonnet opus haiku
+claude-opus-5-5 claude-opus-5-5[1m] claude-fable-5-1 claude-fable-5-1[1m] claude-sonnet-5-5 claude-sonnet-5-5[1m]
 claude-opus-4-8[1m] claude-opus-5 claude-sonnet-5 claude-fable-5[1m]
-claude-haiku-4-5
+claude-haiku-5-5 claude-haiku-5-5[1m] claude-haiku-4-5
+kimi-k3.1-pro kimi-k3.1-pro[1m] kimi-k3.1-pro-highspeed kimi-k3.1-pro-highspeed[1m]
 kimi-k3 kimi-k3[1m] kimi-k2.7-code
 deepseek-v4-pro deepseek-v4-pro[1m] deepseek-flash deepseek-flash[1m]
-qwen3.8-max qwen3.8-max[1m] qwen3.7-max qwen3.7-plus
-gpt-5.6-sol gpt-5.6-sol[1m] gpt-5.3-codex
-grok-4.5 grok-4.3 grok-4.3[1m] grok-build-0.1
+qwen3.8-max qwen3.8-max[1m] qwen3.8-flash qwen3.8-flash[1m] qwen3.7-max qwen3.7-plus
+gpt-6-astra gpt-6.1-sol gpt-6.1-terra gpt-6-luna gpt-6-sol
+gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-5.3-codex
+grok-4.7 grok-4.6 grok-4.5 grok-4.3 grok-4.3[1m] grok-build-0.1
 '
 
 _claude() {
