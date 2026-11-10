@@ -46,9 +46,9 @@ sudo dnf copr enable reversejames/claude-launcher
 sudo dnf install claude-launcher
 ```
 
-The completion lands in `/usr/share/bash-completion/completions/claude` and loads automatically in new shells — no `~/.bashrc` sourcing. If you previously sourced Claude Code's own `~/.claude/completions/claude.bash` from your `~/.bashrc`, that line is now redundant and can be removed.
+The completion lands in `/usr/share/bash-completion/completions/claude` and loads automatically in new shells — no `~/.bashrc` sourcing. If your `~/.bashrc` sources Claude Code's own `~/.claude/completions/claude.bash`, remove that line: a completion registered there takes precedence, so the packaged one never loads.
 
-> On a machine that already has a user-level native install at `~/.local/bin/claude`, that path usually precedes `/usr/bin` in `PATH`, so the native binary still wins. Remove or rename `~/.local/bin/claude` to let the packaged launcher take over as `claude`.
+> A user-level native install puts `~/.local/bin/claude` ahead of `/usr/bin` in `PATH`, and every native install or update rewrites that symlink. The package therefore also installs `/etc/profile.d/claude-launcher.sh`, which defines a `claude` shell function pointing at `/usr/bin/claude`; functions resolve before `PATH`, so the launcher wins in new shells without touching `~/.local/bin`. `command claude` bypasses it.
 
 **Alias (any shell, no root)** — point an alias at the script:
 

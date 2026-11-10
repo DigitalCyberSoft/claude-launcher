@@ -10,8 +10,10 @@ sudo dnf copr enable reversejames/claude-launcher
 sudo dnf install claude-launcher
 ```
 
-This installs the launcher as `/usr/bin/claude` plus a global bash
-completion. Run `claude` for the menu or `claude install` to install or
+This installs the launcher as `/usr/bin/claude`, a global bash
+completion, and `/etc/profile.d/claude-launcher.sh` (a `claude` shell
+function so the launcher wins over a native `~/.local/bin/claude`). Run
+`claude` for the menu or `claude install` to install or
 switch the underlying Claude Code build.
 
 ## How it is built

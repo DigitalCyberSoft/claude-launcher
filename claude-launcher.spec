@@ -1,5 +1,5 @@
 Name:           claude-launcher
-Version:        0.4.0
+Version:        0.4.1
 Release:        1%{?dist}
 Summary:        Menu front-end that becomes the primary `claude`, wrapping Claude Code
 
@@ -18,9 +18,11 @@ Requires:       /usr/bin/curl
 Requires:       jq
 
 # Owns the `claude` command name. There is no distribution `claude`
-# package to conflict with; a user-level native install under
-# ~/.local/bin still takes precedence in a typical user PATH, and the
-# launcher discovers and wraps it either way.
+# package to conflict with. A user-level native install under
+# ~/.local/bin precedes /usr/bin in a typical user PATH, so
+# /etc/profile.d/claude-launcher.sh defines a `claude` shell function
+# that resolves to the launcher ahead of PATH; the launcher discovers
+# and wraps the native build either way.
 Provides:       claude = %{version}-%{release}
 
 %description
@@ -41,7 +43,9 @@ configuration under ~/.config/claude-launcher.
 Providers beyond Anthropic (Moonshot/Kimi, DeepSeek, Qwen, OpenAI, Grok,
 OpenRouter) are supported by routing the same binary through the
 appropriate endpoint or a per-session LiteLLM proxy. A global bash
-completion for `claude` is installed as well.
+completion for `claude` is installed as well, plus a profile.d shell
+function so `claude` reaches the launcher even when a user-level native
+install precedes /usr/bin in PATH.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -52,16 +56,28 @@ install -D -m 0755 claude-launcher %{buildroot}%{_bindir}/claude
 # shells (no ~/.bashrc sourcing needed).
 install -D -m 0644 completions/claude.bash \
     %{buildroot}%{_datadir}/bash-completion/completions/claude
+# Shell function so `claude` reaches the launcher even when a native
+# ~/.local/bin/claude precedes /usr/bin in PATH.
+install -D -m 0644 profile.d/claude-launcher.sh \
+    %{buildroot}%{_sysconfdir}/profile.d/claude-launcher.sh
 install -D -m 0644 README.md %{buildroot}%{_datadir}/doc/%{name}/README.md
 install -D -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
 
 %files
 %{_bindir}/claude
 %{_datadir}/bash-completion/completions/claude
+%config(noreplace) %{_sysconfdir}/profile.d/claude-launcher.sh
 %doc %{_datadir}/doc/%{name}/README.md
 %license %{_datadir}/licenses/%{name}/LICENSE
 
 %changelog
+* Tue Nov 10 2026 DigitalCyberSoft <claude@dcs.io> - 0.4.1-1
+- Ship /etc/profile.d/claude-launcher.sh, a `claude` shell function that
+  resolves to /usr/bin/claude ahead of PATH. A native install's
+  ~/.local/bin/claude precedes /usr/bin and is rewritten by every native
+  install or update, so the documented "rename it" workaround did not
+  survive the next update
+
 * Mon Nov 09 2026 DigitalCyberSoft <claude@dcs.io> - 0.4.0-1
 - Drop the claude.ai-only Artifact tool family (--disallowedTools) on every
   third-party launch: it cannot work without the claude.ai connector, and
